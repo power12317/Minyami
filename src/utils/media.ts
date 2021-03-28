@@ -1,11 +1,10 @@
-import { exec } from "./system";
-import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
-import { AxiosProxyConfig } from "axios";
 import * as fs from "fs";
-import UA from "./ua";
 import { URL } from "url";
 import * as crypto from "crypto";
-const SocksProxyAgent = require("socks-proxy-agent");
+import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
+import { exec } from "./system";
+import ProxyAgentHelper from "../utils/agent";
+import UA from "../constants/ua";
 
 /**
  * 合并视频文件
@@ -78,12 +77,7 @@ export function mergeToTS(fileList = [], output = "./output.ts") {
  * @param url
  * @param path
  */
-export function download(
-    url: string,
-    path: string,
-    proxy: AxiosProxyConfig = undefined,
-    options: AxiosRequestConfig = {}
-) {
+export function download(url: string, path: string, options: AxiosRequestConfig = {}) {
     const CancelToken = axios.CancelToken;
     let source = CancelToken.source();
     const promise = new Promise<void>(async (resolve, reject) => {
@@ -92,13 +86,12 @@ export function download(
                 source && source.cancel();
                 source = null;
             }, options.timeout || 60000);
+            const proxyAgentInstance = ProxyAgentHelper.getProxyAgentInstance();
             const response = await axios({
                 url,
                 method: "GET",
                 responseType: "arraybuffer",
-                httpsAgent: proxy
-                    ? new SocksProxyAgent(`socks5h://${proxy.host}:${proxy.port}`)
-                    : undefined,
+                httpsAgent: proxyAgentInstance ? proxyAgentInstance : undefined,
                 headers: {
                     "User-Agent": UA.CHROME_DEFAULT_UA,
                     Host: new URL(url).host,
@@ -128,19 +121,14 @@ export function download(
  * @param url
  * @param proxy
  */
-export async function requestRaw(
-    url: string,
-    proxy: AxiosProxyConfig = undefined,
-    options: AxiosRequestConfig = {}
-): Promise<AxiosResponse> {
+export async function requestRaw(url: string, options: AxiosRequestConfig = {}): Promise<AxiosResponse> {
+    const proxyAgentInstance = ProxyAgentHelper.getProxyAgentInstance();
     return await axios({
         url,
         method: "GET",
         responseType: "stream",
         timeout: 60000,
-        httpsAgent: proxy
-            ? new SocksProxyAgent(`socks5h://${proxy.host}:${proxy.port}`)
-            : undefined,
+        httpsAgent: proxyAgentInstance ? proxyAgentInstance : undefined,
         headers: {
             "User-Agent": UA.CHROME_DEFAULT_UA,
             Host: new URL(url).host,
