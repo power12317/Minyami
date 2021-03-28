@@ -164,6 +164,9 @@ export function decrypt(input: string, output: string, key: string, iv: string) 
         const i = fs.createReadStream(input);
         const o = fs.createWriteStream(output);
         const pipe = i.pipe(decipher).pipe(o);
-        pipe.on("finish", resolve);
+        pipe.on("finish",  ()=>{
+            fs.unlinkSync(input);
+            resolve(null);
+        });
     });
 }
