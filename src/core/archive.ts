@@ -151,7 +151,7 @@ class ArchiveDownloader extends Downloader {
         // Record start time to calculate speed.
         this.startedAt = new Date().valueOf();
         // Allocate temporary directory.
-        this.tempPath = path.resolve("./", "minyami_" + new Date().valueOf());
+        this.tempPath = path.resolve('./', "minyami_" + new Date().valueOf());
 
         if (!fs.existsSync(this.tempPath)) {
             fs.mkdirSync(this.tempPath);
@@ -440,8 +440,8 @@ class ArchiveDownloader extends Downloader {
     async resume(taskId: string) {
         const previousTask = getTask(taskId.split("?")[0]);
         if (!previousTask) {
-            this.emit("critical-error");
             logger.error("Can't find a task to resume.");
+            this.emit("critical-error");
         }
         logger.info("Previous task found. Resuming.");
 
