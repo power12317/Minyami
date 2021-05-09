@@ -52,7 +52,13 @@ export function mergeToTS(fileList = [], output = "./output.ts") {
         function write() {
             writable = true;
             while (i <= lastIndex && writable) {
+                const temp_i = i;
                 writable = writeStream.write(fs.readFileSync(fileList[i]), () => {
+                    try{
+                        fs.unlink(fileList[temp_i],()=>{});
+                    }catch(e){
+                        console.log(e);
+                    }
                     if (i > lastIndex) {
                         bar.update(i);
                         bar.stop();
