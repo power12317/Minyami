@@ -46,7 +46,7 @@ Help:
          --live                    Download live
          --format <format_name>    (Optional) Set output format. default: ts
              <format_name>         Format name. ts or mkv.
-         --proxy <proxy-server>    Use the specified HTTP/HTTPS/SOCKS proxy
+         --proxy <proxy-server>    Use the specified HTTP/HTTPS/SOCKS5 proxy
              <proxy-server>        Set proxy in [protocol://<host>:<port>] format. eg. --proxy "http://127.0.0.1:1080".
          --slice <range>           Download specified part of the stream
              <range>               Set time range in [<hh:mm:ss>-<hh:mm:ss> format]. eg. --slice "45:00-53:00"
@@ -71,6 +71,10 @@ A: It's not necessary.
 Q: How to set proxy for Minyami.
 
 A: You can use `--proxy` to set proxy server for Minyami. HTTP/SOCKS5 proxy are supported. Or you can use environment variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to provide proxy configuration for Minyami.
+
+Q: How to set temporary file location.
+
+A: You can use environment variables to set the directory of temporary files. See [Issue #80](https://github.com/Last-Order/Minyami/issues/80#issuecomment-869132412).
 
 ## Use as a library (3.1.0+)
 
