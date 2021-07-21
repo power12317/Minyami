@@ -256,7 +256,11 @@ export default class LiveDownloader extends Downloader {
                     logger.warning(`Processing ${task.filename} failed.`);
                     logger.debug(e.message);
                     this.runningThreads--;
-                    this.chunks.unshift(task); // 对直播流来说 早速重试比较好
+                    if(task.retryCount >20){//单chunk 20次都失败 放弃
+                        logger.warning(`chunk ${task.filename} dropped`);
+                        this.outputFileList = this.outputFileList.filter((c) => !c.includes(task.filename))
+                    }else
+                        this.chunks.unshift(task); // 对直播流来说 早速重试比较好
                     this.checkQueue();
                 });
             this.checkQueue();

@@ -373,22 +373,29 @@ class ArchiveDownloader extends Downloader {
                     } else {
                         chunk.retryCount = 1;
                     }
-                    if (chunk.parentGroup) {
-                        if (chunk.parentGroup.isFinished) {
-                            // Add a new group to the queue.
-                            this.chunks.push({
-                                chunks: [chunk],
-                                actions: chunk.parentGroup.actions,
-                                isFinished: false,
-                                isNew: true,
-                            } as ChunkGroup);
+
+                    if(chunk.retryCount >20){//单chunk 20次都失败 放弃
+                        logger.warning(`Dropped chunk ${chunk.filename} , max retries exceeded.`);
+                        this.outputFileList = this.outputFileList.filter((c) => !c.includes(chunk.filename))
+                    }else{
+                        if (chunk.parentGroup) {
+                            if (chunk.parentGroup.isFinished) {
+                                // Add a new group to the queue.
+                                this.chunks.push({
+                                    chunks: [chunk],
+                                    actions: chunk.parentGroup.actions,
+                                    isFinished: false,
+                                    isNew: true,
+                                } as ChunkGroup);
+                            } else {
+                                chunk.parentGroup.retryActions = true;
+                                chunk.parentGroup.chunks.push(chunk);
+                            }
                         } else {
-                            chunk.parentGroup.retryActions = true;
-                            chunk.parentGroup.chunks.push(chunk);
+                            this.chunks.push(chunk);
                         }
-                    } else {
-                        this.chunks.push(chunk);
                     }
+                    
                     this.checkQueue();
                 });
             this.checkQueue();
