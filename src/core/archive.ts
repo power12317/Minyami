@@ -375,7 +375,7 @@ class ArchiveDownloader extends Downloader {
                     }
 
                     if(chunk.retryCount >20){//单chunk 20次都失败 放弃
-                        logger.warning(`Dropped chunk ${chunk.filename} , max retries exceeded.`);
+                        logger.warning(`Dropping chunk ${chunk.filename} , max retries exceeded.`);
                         this.outputFileList = this.outputFileList.filter((c) => !c.includes(chunk.filename))
                     }else{
                         if (chunk.parentGroup) {
