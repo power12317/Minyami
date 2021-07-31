@@ -257,7 +257,7 @@ export default class LiveDownloader extends Downloader {
                     logger.debug(e.message);
                     this.runningThreads--;
                     if(task.retryCount >20){//单chunk 20次都失败 放弃
-                        logger.warning(`Dropped chunk ${task.filename} , max retries exceeded.`);
+                        logger.warning(`Dropping chunk ${task.filename} , max retries exceeded.`);
                         this.outputFileList = this.outputFileList.filter((c) => !c.includes(task.filename))
                     }else
                         this.chunks.unshift(task); // 对直播流来说 早速重试比较好
