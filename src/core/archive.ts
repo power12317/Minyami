@@ -2,19 +2,18 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import axios from "axios";
-import { URL } from "url";
 import { mergeToMKV, mergeToTS } from "../utils/media";
 import { deleteDirectory } from "../utils/system";
 import { saveTask, deleteTask, getTask } from "../utils/task";
 import { timeStringToSeconds } from "../utils/time";
 import logger from "../utils/log";
-import M3U8 from "./m3u8";
+import { Playlist } from "./m3u8";
 import Downloader, { ArchiveDownloaderConfig, ChunkItem, isChunkGroup, Chunk, ChunkGroup } from "./downloader";
 
 class ArchiveDownloader extends Downloader {
     tempPath: string;
     m3u8Path: string;
-    m3u8: M3U8;
+    m3u8: Playlist;
 
     chunks: ChunkItem[] = [];
     allChunks: ChunkItem[] = [];
@@ -82,36 +81,38 @@ class ArchiveDownloader extends Downloader {
      */
     async parse() {
         // parse m3u8
-        if (this.m3u8.isEncrypted) {
+        if (this.m3u8.encryptKeys.length > 0) {
             // Encrypted
-            const key = this.m3u8.getKey();
+            const key = this.m3u8.encryptKeys[0];
             if (key.startsWith("abematv-license")) {
                 logger.info("Site comfirmed: AbemaTV.");
                 const parser = await import("./parsers/abema");
                 parser.default.parse({
                     downloader: this,
                 });
-                logger.info(`Key: ${this.key}; IV: ${this.m3u8.iv}.`);
             } else if (this.m3u8Path.includes("dmm.com")) {
                 logger.info("Site comfirmed: DMM.");
                 const parser = await import("./parsers/dmm");
                 parser.default.parse({
                     downloader: this,
                 });
-                logger.info(`Key: ${this.key}; IV: ${this.m3u8.sequenceId}.`);
             } else if (this.m3u8Path.includes("d22puzix29w08m")) {
                 logger.info("Site comfirmed: Hibiki-Radio.");
                 const parser = await import("./parsers/hibiki");
                 parser.default.parse({
                     downloader: this,
                 });
-                logger.info(`Key: ${this.key}; IV: ${this.m3u8.iv}.`);
             } else {
                 logger.warning(`Site is not supported by Minyami Core. Try common parser.`);
-                const parser = await import("./parsers/common");
-                await parser.default.parse({
-                    downloader: this,
-                });
+                try {
+                    const parser = await import("./parsers/common");
+                    await parser.default.parse({
+                        downloader: this,
+                    });
+                } catch (e) {
+                    logger.error("Aborted due to critical error.", e);
+                    this.emit("critical-error");
+                }
             }
         } else {
             // Not encrypted
@@ -140,10 +141,15 @@ class ArchiveDownloader extends Downloader {
                 });
             } else {
                 logger.warning(`Site is not supported by Minyami Core. Try common parser.`);
-                const parser = await import("./parsers/common");
-                await parser.default.parse({
-                    downloader: this,
-                });
+                try {
+                    const parser = await import("./parsers/common");
+                    await parser.default.parse({
+                        downloader: this,
+                    });
+                } catch (e) {
+                    logger.error("Aborted due to critical error.", e);
+                    this.emit("critical-error");
+                }
             }
         }
     }
@@ -170,18 +176,24 @@ class ArchiveDownloader extends Downloader {
         logger.info(`Start downloading with ${this.threads} thread(s).`);
         if (this.autoGenerateChunkList) {
             this.chunks = this.m3u8.chunks.map((chunk) => {
-                return {
-                    url: chunk.url,
-                    filename: this.onChunkNaming
-                        ? this.onChunkNaming(chunk)
-                        : new URL(chunk.url).pathname
-                              .split("/")
-                              .slice(-1)[0]
-                              .slice(8 - 255),
-                    key: chunk.key,
-                    iv: chunk.iv,
-                    sequenceId: chunk.sequenceId,
-                };
+                const filename = this.onChunkNaming(chunk);
+                return chunk.isEncrypted
+                    ? {
+                          url: chunk.url,
+                          filename,
+                          key: chunk.key,
+                          iv: chunk.iv,
+                          sequenceId: chunk.sequenceId,
+                          isEncrypted: true,
+                          length: chunk.length,
+                      }
+                    : {
+                          url: chunk.url,
+                          filename,
+                          sequenceId: chunk.sequenceId,
+                          isEncrypted: false,
+                          length: chunk.length,
+                      };
             });
         }
         if (this.sliceStart !== undefined && this.sliceEnd !== undefined) {
@@ -192,10 +204,14 @@ class ArchiveDownloader extends Downloader {
                     break;
                 }
                 if (isChunkGroup(chunk)) {
+                    const chunkGroupTotalLength = chunk.chunks.reduce(
+                        (prevLength, chunk) => prevLength + chunk.length,
+                        0
+                    );
                     // 处理一组块
-                    if (nowTime + chunk.chunks.length * this.m3u8.getChunkLength() < this.sliceStart) {
+                    if (nowTime + chunkGroupTotalLength < this.sliceStart) {
                         // 加上整个块都还没有到开始时间
-                        nowTime += chunk.chunks.length * this.m3u8.getChunkLength();
+                        nowTime += chunkGroupTotalLength;
                         continue;
                     } else {
                         // 组中至少有一个已经在时间范围内
@@ -206,16 +222,13 @@ class ArchiveDownloader extends Downloader {
                             isNew: true,
                         };
                         for (const c of chunk.chunks) {
-                            if (
-                                nowTime + this.m3u8.getChunkLength() >= this.sliceStart &&
-                                nowTime + this.m3u8.getChunkLength() < this.sliceEnd
-                            ) {
+                            if (nowTime + c.length >= this.sliceStart && nowTime + c.length < this.sliceEnd) {
                                 // 添加已经在时间范围内的块
                                 newChunkItem.chunks.push(c);
-                                nowTime += this.m3u8.getChunkLength();
+                                nowTime += c.length;
                             } else {
                                 // 跳过时间范围外的块
-                                nowTime += this.m3u8.getChunkLength();
+                                nowTime += c.length;
                                 continue;
                             }
                         }
@@ -225,12 +238,13 @@ class ArchiveDownloader extends Downloader {
                     // 处理普通块
                     if (nowTime >= this.sliceStart) {
                         newChunkList.push(chunk);
-                        nowTime += this.m3u8.getChunkLength();
+                        nowTime += chunk.length;
                     } else {
-                        nowTime += this.m3u8.getChunkLength();
+                        nowTime += chunk.length;
                     }
                 }
             }
+
             this.chunks = newChunkList;
         }
 
@@ -253,14 +267,14 @@ class ArchiveDownloader extends Downloader {
         this.outputFileList = [];
         this.chunks.forEach((chunkItem) => {
             if (!isChunkGroup(chunkItem)) {
-                if (this.m3u8.isEncrypted) {
+                if (chunkItem.isEncrypted) {
                     this.outputFileList.push(path.resolve(this.tempPath, `./${chunkItem.filename}.decrypt`));
                 } else {
                     this.outputFileList.push(path.resolve(this.tempPath, `./${chunkItem.filename}`));
                 }
             } else {
                 for (const chunk of chunkItem.chunks) {
-                    if (this.m3u8.isEncrypted) {
+                    if (chunk.isEncrypted) {
                         this.outputFileList.push(path.resolve(this.tempPath, `./${chunk.filename}.decrypt`));
                     } else {
                         this.outputFileList.push(path.resolve(this.tempPath, `./${chunk.filename}`));
@@ -271,7 +285,7 @@ class ArchiveDownloader extends Downloader {
         if (this.verbose) {
             setInterval(() => {
                 logger.debug(
-                    `Now running threads: ${this.runningThreads}, finished chunks: ${this.finishedChunksCount}, total chunks: ${this.totalChunksCount}`
+                    `Now running threads: ${this.runningThreads}, finished chunks: ${this.finishedChunkCount}, total chunks: ${this.totalChunksCount}`
                 );
             }, 3000);
         }
@@ -284,7 +298,7 @@ class ArchiveDownloader extends Downloader {
     getETA() {
         const usedTime = new Date().valueOf() - this.startedAt;
         const remainingTimeInSeconds = Math.round(
-            ((usedTime / this.finishedChunksCount) * this.totalChunksCount - usedTime) / 1000
+            ((usedTime / this.finishedChunkCount) * this.totalChunksCount - usedTime) / 1000
         );
         if (remainingTimeInSeconds < 60) {
             return `${remainingTimeInSeconds}s`;
@@ -339,11 +353,10 @@ class ArchiveDownloader extends Downloader {
             this.runningThreads++;
             this.handleTask(chunk)
                 .then(() => {
-                    this.finishedChunksCount++;
                     this.runningThreads--;
                     const currentChunkInfo = {
                         taskname: chunk.filename,
-                        finishedChunksCount: this.finishedChunksCount,
+                        finishedChunksCount: this.finishedChunkCount,
                         totalChunksCount: this.totalChunksCount,
                         chunkSpeed: this.calculateSpeedByChunk(),
                         ratioSpeed: this.calculateSpeedByRatio(),
@@ -351,9 +364,9 @@ class ArchiveDownloader extends Downloader {
                     };
 
                     logger.info(
-                        `Processing ${currentChunkInfo.taskname} finished. (${
-                            currentChunkInfo.finishedChunksCount
-                        } / ${this.totalChunksCount} or ${(
+                        `Processing ${currentChunkInfo.taskname} finished. (${currentChunkInfo.finishedChunksCount} / ${
+                            this.totalChunksCount
+                        } or ${(
                             (currentChunkInfo.finishedChunksCount / currentChunkInfo.totalChunksCount) *
                             100
                         ).toFixed(2)}% | Avg Speed: ${currentChunkInfo.chunkSpeed} chunks/s or ${
@@ -402,7 +415,7 @@ class ArchiveDownloader extends Downloader {
         }
         if (
             this.chunks.length === 0 &&
-            this.totalChunksCount === this.finishedChunksCount &&
+            this.totalChunksCount === this.finishedChunkCount &&
             this.runningThreads === 0
         ) {
             if (this.isDownloaded) {
@@ -420,7 +433,7 @@ class ArchiveDownloader extends Downloader {
                 this.emit("finished");
             }
             muxer(this.outputFileList, this.outputPath)
-                .then(async () => {
+                .then(async (outputPath) => {
                     logger.info("End of merging.");
                     logger.info("Starting cleaning temporary files.");
                     try {
@@ -436,7 +449,7 @@ class ArchiveDownloader extends Downloader {
                         logger.warning("Fail to parse previous tasks, ignored.");
                         logger.warning(error.message);
                     }
-                    logger.info(`All finished. Check your file at [${path.resolve(this.outputPath)}] .`);
+                    logger.info(`All finished. Check your file at [${path.resolve(outputPath)}] .`);
                     this.emit("finished");
                 })
                 .catch(async (e) => {
@@ -471,10 +484,8 @@ class ArchiveDownloader extends Downloader {
         this.cookies = previousTask.cookies;
         this.headers = previousTask.headers;
         this.key = previousTask.key;
-        this.iv = previousTask.iv;
         this.verbose = previousTask.verbose;
         this.startedAt = new Date().valueOf();
-        this.finishedChunksCount = 0;
         this.totalChunksCount = previousTask.totalChunksCount - previousTask.finishedChunksCount;
         this.retries = previousTask.retries;
         this.timeout = previousTask.timeout;
@@ -541,7 +552,7 @@ class ArchiveDownloader extends Downloader {
             unfinishedChunksLength += isChunkGroup(chunk) ? chunk.chunks.length : 1;
         }
 
-        logger.info(`Downloaded: ${this.finishedChunksCount}; Waiting for download: ${unfinishedChunksLength}`);
+        logger.info(`Downloaded: ${this.finishedChunkCount}; Waiting for download: ${unfinishedChunksLength}`);
 
         try {
             saveTask({
@@ -553,10 +564,10 @@ class ArchiveDownloader extends Downloader {
                 cookies: this.cookies,
                 headers: this.headers,
                 key: this.key,
-                iv: this.iv,
                 verbose: this.verbose,
                 startedAt: this.startedAt,
                 finishedChunksCount: this.totalChunksCount - unfinishedChunksLength,
+                finishedChunkLength: this.finishedChunkLength,
                 totalChunksCount: this.totalChunksCount,
                 retries: this.retries,
                 timeout: this.timeout,
