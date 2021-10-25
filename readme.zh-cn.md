@@ -21,10 +21,10 @@
 Help:
      命令                      描述                   别名
 
-     --help <command>              显示帮助       --h
+     --help <command>              显示帮助       -h
          <command>                 显示某命令的帮助
      --version                     显示版本号
-     --download <input_path>       下载视频             --d
+     --download <input_path>       下载视频             -d
          <input_path>              m3u8 文件路径
          --threads <limit>         并发数量限制
              <limit>               (可选) 并发数量的限制，默认为5
@@ -36,8 +36,8 @@ Help:
              <key>                 (可选) 视频解密 Key.
          --cookies <cookies>       (可选) 视频下载 Cookies
              <cookies>
-         --headers <headers>       手动设定 HTTP Headers
-             <headers>             多个 Header 使用 "\n" 分隔，例如："Cookie: a=1\nUser-Agent: X-UA"
+         --headers, H <headers>    手动设定 HTTP Header
+             <headers>             自定义 HTTP Header，例如："User-Agent: X-UA"
          --live                    直播下载模式
          --format <format_name>    (可选) 输出格式，默认为 ts
              <format_name>         格式名称，ts 或 mkv
@@ -46,7 +46,7 @@ Help:
          --slice <range>           下载部分内容
              <range>               设置时间范围，格式为 [<hh:mm:ss>-<hh:mm:ss> format] 例如 --slice "45:00-53:00"
          --nomerge, keep           不合并视频分块。
-     --resume <input_path>         恢复下载 (不适用于直播)  --r
+     --resume <input_path>         恢复下载 (不适用于直播)  -r
          <input_path>              m3u8 文件路径
      --clean                       清除缓存文件和任务信息
 
@@ -69,3 +69,7 @@ A: 可以使用`--proxy`参数设置代理，详见上方用法。目前支持`H
 Q: 如何设置临时文件目录？
 
 A: 通过环境变量可以设置临时文件目录。详见 [Issue #80](https://github.com/Last-Order/Minyami/issues/80#issuecomment-869132412)。
+
+Q: 如何设置多个 HTTP Header？
+
+A: 通过设置多个`-H`或`--headers`，例如`minyami -d xxxx -H "Cookie: xxxx" --headers "User-Agent: yyy"`。

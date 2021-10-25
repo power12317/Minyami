@@ -1,16 +1,17 @@
 import * as path from "path";
 import * as fs from "fs";
+import { URL } from "url";
 import axios, { AxiosRequestConfig } from "axios";
 import { EventEmitter } from "events";
 import logger from "../utils/log";
-import M3U8, { M3U8Chunk } from "./m3u8";
 import { loadM3U8 } from "../utils/m3u8";
 import * as system from "../utils/system";
 import CommonUtils from "../utils/common";
 import { download, decrypt } from "../utils/media";
 import ProxyAgentHelper from "../utils/agent";
 import UA from "../constants/ua";
-import { ActionType } from "./action";
+import { EncryptedM3U8Chunk, M3U8Chunk, MasterPlaylist, Playlist } from "./m3u8";
+import type { ActionType } from "./action";
 import * as actions from "./action";
 
 export interface DownloaderConfig {
@@ -19,7 +20,7 @@ export interface DownloaderConfig {
     key?: string;
     verbose?: boolean;
     cookies?: string;
-    headers?: string;
+    headers?: string | string[];
     retries?: number;
     proxy?: string;
     format?: string;
@@ -36,11 +37,12 @@ export interface LiveDownloaderConfig extends DownloaderConfig {}
 export interface Chunk {
     url: string;
     filename: string;
-    isEncrypted?: boolean;
+    isEncrypted: boolean;
     parentGroup?: ChunkGroup;
     key?: string;
     iv?: string;
-    sequenceId?: string;
+    length: number;
+    sequenceId?: number;
     retryCount?: number;
 }
 
@@ -66,30 +68,46 @@ export function isChunkGroup(c: ChunkItem): c is ChunkGroup {
 class Downloader extends EventEmitter {
     cliMode: boolean = false;
 
-    tempPath: string; // 临时文件目录
-    m3u8Path: string; // m3u8文件路径
-    m3u8: M3U8; // m3u8实体
-    outputPath: string = "./output.ts"; // 输出目录
-    threads: number = 5; // 并发数量
+    /** 临时文件目录 */
+    tempPath: string;
+    /** m3u8文件路径 */
+    m3u8Path: string;
+    /** M3U8 Playlist */
+    m3u8: Playlist;
+    /** 输出目录 */
+    outputPath: string = "./output.ts";
+    /** 并发数量 */
+    threads: number = 5;
 
     allChunks: ChunkItem[];
     chunks: ChunkItem[];
     pickedChunks: ChunkItem[];
 
-    cookies: string; // Cookies
-    headers: object = {}; // HTTP Headers
-    key: string; // Key
-    iv: string; // IV
+    /** Cookies */
+    cookies: string;
+    /** HTTP Headers */
+    headers: object = {};
+    key: string;
 
-    verbose: boolean = false; // 调试输出
-    format: string = "ts"; // 输出格式
+    /** 是否打印调试信息 */
+    verbose: boolean = false;
+    /** 输出格式 */
+    format: string = "ts";
     noMerge: boolean = false;
 
-    startedAt: number; // 开始下载时间
-    finishedChunksCount: number = 0; // 已完成的块数量
+    /** 开始下载时间 */
+    startedAt: number;
+    /** 块总长度 */
+    totalChunkLength: number = 0;
+    /** 已完成的块数量 */
+    finishedChunkCount: number = 0;
+    /** 已完成的块总长度 */
+    finishedChunkLength: number = 0;
 
-    retries: number = 5; // 重试数量
-    timeout: number = 60000; // 超时时间
+    /** 重试数量 */
+    retries: number = 5;
+    /** 超时时间 */
+    timeout: number = 60000;
 
     proxy: string = "";
 
@@ -98,15 +116,13 @@ class Downloader extends EventEmitter {
     encryptionKeys = {};
 
     // Hooks
-    onChunkNaming: (chunk: M3U8Chunk) => string;
-    onDownloadError: (error: Error, downloader: Downloader) => void;
+    protected onChunkNaming: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string = (chunk) => {
+        return new URL(chunk.url).pathname
+            .split("/")
+            .slice(-1)[0]
+            .slice(8 - 255);
+    };
 
-    /**
-     *
-     * @param m3u8Path
-     * @param config
-     * @param config.threads 线程数量
-     */
     constructor(
         m3u8Path: string,
         {
@@ -133,13 +149,6 @@ class Downloader extends EventEmitter {
 
         if (output) {
             this.outputPath = output;
-            if (fs.existsSync(this.outputPath)) {
-                // output filename conflict
-                const pathArr = this.outputPath.split(".");
-                const filePath = pathArr.slice(0, -1).join(".");
-                const ext = pathArr[pathArr.length - 1];
-                this.outputPath = `${filePath}_${Date.now()}.${ext}`;
-            }
         }
 
         if (key) {
@@ -163,12 +172,15 @@ class Downloader extends EventEmitter {
         }
 
         if (headers) {
-            for (const h of headers.split("\\n")) {
-                try {
-                    const header = /^([^ :]+):(.+)$/.exec(h).slice(1);
-                    this.headers[header[0]] = header[1].trim();
-                } catch (e) {
-                    logger.warning(`HTTP Headers invalid. Ignored.`);
+            const headerConfigArr = Array.isArray(headers) ? headers : [headers];
+            for (const headerConfig of headerConfigArr) {
+                for (const h of headerConfig.split("\\n")) {
+                    try {
+                        const header = /^([^ :]+):(.+)$/.exec(h).slice(1);
+                        this.headers[header[0]] = header[1].trim();
+                    } catch (e) {
+                        logger.warning(`HTTP Headers invalid. Ignored.`);
+                    }
                 }
             }
             // Apply global custom headers
@@ -228,7 +240,20 @@ class Downloader extends EventEmitter {
 
     async loadM3U8() {
         try {
-            this.m3u8 = await loadM3U8(this.m3u8Path, this.retries, this.timeout);
+            const m3u8 = await loadM3U8(this.m3u8Path, this.retries, this.timeout);
+            if (m3u8 instanceof MasterPlaylist) {
+                const streams = m3u8.streams;
+                const bestStream = streams.sort((a, b) => b.bandwidth - a.bandwidth)[0];
+                logger.info("Master playlist input detected. Auto selecting best quality streams.");
+                logger.debug(`Best stream: ${bestStream.url}; Bandwidth: ${bestStream.bandwidth}`);
+                this.m3u8 = (await loadM3U8(bestStream.url, this.retries, this.timeout)) as Playlist;
+            } else {
+                this.m3u8 = m3u8;
+            }
+            this.totalChunkLength = this.m3u8.chunks.reduce(
+                (prevLength, currentChunk) => prevLength + currentChunk.length,
+                0
+            );
         } catch (e) {
             logger.error("Aborted due to critical error.", e);
             this.emit("critical-error");
@@ -262,15 +287,17 @@ class Downloader extends EventEmitter {
             try {
                 await download(task.url, path.resolve(this.tempPath, `./${task.filename}`), options);
                 logger.debug(`Downloading ${task.filename} succeed.`);
-                if (this.m3u8.isEncrypted) {
+                if (task.isEncrypted) {
                     await decrypt(
                         path.resolve(this.tempPath, `./${task.filename}`),
                         path.resolve(this.tempPath, `./${task.filename}`) + ".decrypt",
-                        this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, task.key || this.m3u8.key)),
-                        task.iv || this.m3u8.iv || task.sequenceId || this.m3u8.sequenceId
+                        this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, task.key)),
+                        task.iv || task.sequenceId.toString(16)
                     );
                     logger.debug(`Decrypting ${task.filename} succeed`);
                 }
+                this.finishedChunkCount++;
+                this.finishedChunkLength += task.length;
                 resolve();
             } catch (e) {
                 logger.warning(
@@ -305,6 +332,12 @@ class Downloader extends EventEmitter {
         }
     }
 
+    /**
+     * ======================
+     * Some hooks for parsers
+     * ======================
+     */
+
     saveEncryptionKey(url: string, key: string) {
         this.encryptionKeys[url] = key;
     }
@@ -313,21 +346,22 @@ class Downloader extends EventEmitter {
         return this.encryptionKeys[url];
     }
 
+    setOnChunkNaming(handler: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string) {
+        this.onChunkNaming = handler;
+    }
+
     /**
      * 计算以块计算的下载速度
      */
     calculateSpeedByChunk() {
-        return (this.finishedChunksCount / Math.round((new Date().valueOf() - this.startedAt) / 1000)).toFixed(2);
+        return (this.finishedChunkCount / Math.round((new Date().valueOf() - this.startedAt) / 1000)).toFixed(2);
     }
 
     /**
      * 计算以视频长度为基准下载速度倍率
      */
     calculateSpeedByRatio() {
-        return (
-            (this.finishedChunksCount * this.m3u8.getChunkLength()) /
-            Math.round((new Date().valueOf() - this.startedAt) / 1000)
-        ).toFixed(2);
+        return (this.finishedChunkLength / Math.round((new Date().valueOf() - this.startedAt) / 1000)).toFixed(2);
     }
 }
 
