@@ -87,6 +87,13 @@ export class MasterPlaylist {
                     ...(parsedTagBody["CODECS"] ? { codecs: parsedTagBody["CODECS"] } : {}),
                     ...(parsedTagBody["FRAME-RATE"] ? { frameRate: +parsedTagBody["FRAME-RATE"] } : {}),
                 };
+                if (parsedTagBody["RESOLUTION"] && parsedTagBody["RESOLUTION"].includes("x")) {
+                    const [x, y] = parsedTagBody["RESOLUTION"].split("x").map((n) => parseInt(n));
+                    streamInfo.resolution = {
+                        width: x,
+                        height: y,
+                    };
+                }
                 this.streams.push(streamInfo);
             }
             // TODO: Support #EXT-X-MEDIA
@@ -148,7 +155,6 @@ export class Playlist {
                     }
                     this.encryptKeys.push(key);
                 } else {
-                    console.log(parsedTagBody["METHOD"]);
                     // SAMPLE-AES is rare in production and it's not supported by Minyami.
                     throw new M3U8ParseError("Unsupported encrypt method.");
                 }
@@ -224,7 +230,9 @@ export class Playlist {
         if (this.averageChunkLength) {
             return this.averageChunkLength;
         }
-        return this.chunks.reduce((prevLength, chunk) => prevLength + chunk.length, 0) / this.chunks.length;
+        const result = this.chunks.reduce((prevLength, chunk) => prevLength + chunk.length, 0) / this.chunks.length;
+        this.averageChunkLength = result;
+        return result;
     }
 }
 
