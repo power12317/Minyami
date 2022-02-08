@@ -60,11 +60,17 @@ export default class LiveDownloader extends Downloader {
             this.m3u8 = (await loadM3U8(this.m3u8Path, this.retries, this.timeout)) as Playlist;
         } catch (e) {
             if (this.finishedChunkCount > 0) {
-                // Stop downloading
-                this.isEnd = true;
+                const responseStatus = e?.response?.status;
+                if (!!responseStatus && responseStatus >= 400 && responseStatus <= 599) {
+                    logger.info("M3U8 file is no longer available. Stop downloading.");
+                    // Stop downloading
+                    this.isEnd = true;
+                }
             } else {
                 logger.error("Aborted due to critical error.", e);
-                this.emit("critical-error");
+                logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+                this.saveTask();
+                this.emit("critical-error", e);
             }
         }
     }
@@ -87,6 +93,8 @@ export default class LiveDownloader extends Downloader {
                     this.forceStop = true;
                 } else {
                     logger.info("Force stop."); // TODO: reject all download promises
+                    logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+                    this.saveTask();
                     this.emit("finished");
                 }
             });
@@ -107,10 +115,15 @@ export default class LiveDownloader extends Downloader {
             }
         } catch (e) {
             logger.error("Aborted due to critical error.", e);
-            this.emit("critical-error");
+            logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+            this.saveTask();
+            this.emit("critical-error", e);
         }
 
-        this.timeout = Math.max(20000, this.m3u8.chunks.length * this.m3u8.getChunkLength() * 1000);
+        this.chunkTimeout = Math.min(
+            Math.max(20000, this.m3u8.chunks.length * this.m3u8.getChunkLength() * 1000),
+            60000
+        );
 
         if (this.m3u8.encryptKeys.length > 0) {
             this.isEncrypted = true;
@@ -119,6 +132,16 @@ export default class LiveDownloader extends Downloader {
                 logger.info("Site comfirmed: AbemaTV");
                 const parser = await import("./parsers/abema");
                 parser.default.parse({
+                    downloader: this,
+                });
+            } else if (this.m3u8Path.includes("hls-auth.cloud.stream.co.jp")) {
+                logger.info("Site comfirmed: Nicochannel.");
+                const nicoChannelParser = await import("./parsers/nicochannel");
+                nicoChannelParser.default.parse({
+                    downloader: this,
+                });
+                const commonParser = await import("./parsers/common");
+                await commonParser.default.parse({
                     downloader: this,
                 });
             } else {
@@ -130,7 +153,9 @@ export default class LiveDownloader extends Downloader {
                     });
                 } catch (e) {
                     logger.error("Aborted due to critical error.", e);
-                    this.emit("critical-error");
+                    logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+                    this.saveTask();
+                    this.emit("critical-error", e);
                 }
             }
         } else {
@@ -158,7 +183,9 @@ export default class LiveDownloader extends Downloader {
                     });
                 } catch (e) {
                     logger.error("Aborted due to critical error.", e);
-                    this.emit("critical-error");
+                    logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+                    this.saveTask();
+                    this.emit("critical-error", e);
                 }
             }
         }
@@ -168,6 +195,7 @@ export default class LiveDownloader extends Downloader {
                 logger.debug(
                     `Now running threads: ${this.runningThreads}, finished chunks: ${this.finishedChunkCount}`
                 );
+                this.saveTask();
             }, 3000);
         }
         await this.cycling();
@@ -269,7 +297,7 @@ export default class LiveDownloader extends Downloader {
                     this.checkQueue();
                 })
                 .catch((e) => {
-                    this.emit("chunk-error", e);
+                    this.emit("chunk-error", e, task.filename);
                     // 重试计数
                     if (task.retryCount) {
                         task.retryCount++;
@@ -294,6 +322,7 @@ export default class LiveDownloader extends Downloader {
             if (this.noMerge) {
                 logger.info("Skip merging. Please merge video chunks manually.");
                 logger.info(`Temporary files are located at ${this.tempPath}`);
+                this.saveTask();
                 this.emit("finished");
             }
             logger.info(`${this.finishedChunkCount} chunks downloaded. Start merging chunks.`);
@@ -307,7 +336,8 @@ export default class LiveDownloader extends Downloader {
                 })
                 .catch((e) => {
                     logger.error("Fail to merge video. Please merge video chunks manually.", e);
-                    logger.error(`Your temporary files at located at [${path.resolve(this.tempPath)}]`);
+                    logger.info(`Your temporary files are located at [${path.resolve(this.tempPath)}]`);
+                    this.saveTask();
                     this.emit("critical-error", e);
                 });
         }
@@ -318,6 +348,31 @@ export default class LiveDownloader extends Downloader {
             sleep(1000).then(() => {
                 this.checkQueue();
             });
+        }
+    }
+
+    saveTask() {
+        const taskInfo = {
+            tempPath: this.tempPath,
+            m3u8Path: this.m3u8Path,
+            outputPath: this.outputPath,
+            threads: this.threads,
+            cookies: this.cookies,
+            headers: this.headers,
+            key: this.key,
+            verbose: this.verbose,
+            startedAt: this.startedAt,
+            retries: this.retries,
+            timeout: this.timeout,
+            proxy: this.proxy,
+            outputFileList: this.outputFileList,
+        };
+        const savePath = path.resolve(this.tempPath, "./task.json");
+        try {
+            fs.writeFileSync(savePath, JSON.stringify(taskInfo, null, 2));
+        } catch (e) {
+            logger.warning("Fail to save task info.");
+            logger.debug(e);
         }
     }
 }

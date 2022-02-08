@@ -102,6 +102,16 @@ class ArchiveDownloader extends Downloader {
                 parser.default.parse({
                     downloader: this,
                 });
+            } else if (this.m3u8Path.includes("hls-auth.cloud.stream.co.jp")) {
+                logger.info("Site comfirmed: Nicochannel.");
+                const nicoChannelParser = await import("./parsers/nicochannel");
+                nicoChannelParser.default.parse({
+                    downloader: this,
+                });
+                const commonParser = await import("./parsers/common");
+                await commonParser.default.parse({
+                    downloader: this,
+                });
             } else {
                 logger.warning(`Site is not supported by Minyami Core. Try common parser.`);
                 try {
@@ -111,7 +121,7 @@ class ArchiveDownloader extends Downloader {
                     });
                 } catch (e) {
                     logger.error("Aborted due to critical error.", e);
-                    this.emit("critical-error");
+                    this.emit("critical-error", e);
                 }
             }
         } else {
@@ -148,7 +158,7 @@ class ArchiveDownloader extends Downloader {
                     });
                 } catch (e) {
                     logger.error("Aborted due to critical error.", e);
-                    this.emit("critical-error");
+                    this.emit("critical-error", e);
                 }
             }
         }
@@ -384,7 +394,7 @@ class ArchiveDownloader extends Downloader {
                     this.checkQueue();
                 })
                 .catch((e) => {
-                    this.emit("chunk-error", e);
+                    this.emit("chunk-error", e, chunk.filename);
                     this.runningThreads--;
                     // 重试计数
                     if (chunk.retryCount) {
@@ -471,7 +481,7 @@ class ArchiveDownloader extends Downloader {
         const previousTask = getTask(taskId.split("?")[0]);
         if (!previousTask) {
             logger.error("Can't find a task to resume.");
-            this.emit("critical-error");
+            this.emit("critical-error", new Error("Can't find a task to resume."));
         }
         logger.info("Previous task found. Resuming.");
 
