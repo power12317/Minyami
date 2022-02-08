@@ -429,6 +429,12 @@ class ArchiveDownloader extends Downloader {
                 });
             this.checkQueue();
         }
+        
+        if(this.outputFileList.length === 0){
+            logger.error("Empty output file");
+            this.emit("critical-error");
+        }
+
         if (
             this.chunks.length === 0 &&
             this.totalChunksCount === this.finishedChunkCount &&
