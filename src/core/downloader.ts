@@ -61,6 +61,13 @@ export interface ChunkGroup {
 
 export type ChunkItem = Chunk | ChunkGroup;
 
+export interface OnKeyUpdatedParams {
+    keyUrls: string[];
+    m3u8Url: string;
+    explicitKeys: string[];
+    saveEncryptionKey: (url: string, key: string) => void;
+}
+
 export function isChunkGroup(c: ChunkItem): c is ChunkGroup {
     return !!(c as ChunkGroup).chunks;
 }
@@ -76,6 +83,8 @@ class Downloader extends EventEmitter {
     m3u8: Playlist;
     /** 输出目录 */
     outputPath: string = "./output.ts";
+    /** 输出文件列表 */
+    outputFileList: string[];
     /** 并发数量 */
     threads: number = 5;
 
@@ -126,6 +135,8 @@ class Downloader extends EventEmitter {
             .slice(-1)[0]
             .slice(8 - 255);
     };
+
+    protected async onKeyUpdated({ keyUrls, explicitKeys, saveEncryptionKey }: OnKeyUpdatedParams) {}
 
     constructor(
         m3u8Path: string,
@@ -264,13 +275,29 @@ class Downloader extends EventEmitter {
         }
     }
 
+    async checkKeys() {
+        if (this.m3u8.encryptKeys.length > 0) {
+            const newKeys = this.m3u8.encryptKeys.filter(
+                (key) => !this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, key))
+            );
+            if (newKeys.length > 0) {
+                await this.onKeyUpdated({
+                    keyUrls: newKeys,
+                    explicitKeys: this.key ? this.key.split(",") : [],
+                    m3u8Url: this.m3u8.m3u8Url,
+                    saveEncryptionKey: this.saveEncryptionKey.bind(this),
+                });
+            }
+        }
+    }
+
     /**
      * 退出前的清理工作
      */
     async clean() {
         try {
             logger.info("Starting cleaning temporary files.");
-            await system.deleteDirectory(this.tempPath);
+            await system.deleteDirectory(this.tempPath, this.outputFileList);
         } catch (e) {
             logger.warning(
                 `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
@@ -352,6 +379,10 @@ class Downloader extends EventEmitter {
 
     setOnChunkNaming(handler: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string) {
         this.onChunkNaming = handler;
+    }
+
+    setOnKeyUpdated(handler: (params: OnKeyUpdatedParams) => Promise<void>) {
+        this.onKeyUpdated = handler;
     }
 
     /**

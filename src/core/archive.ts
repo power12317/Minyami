@@ -90,12 +90,6 @@ class ArchiveDownloader extends Downloader {
                 parser.default.parse({
                     downloader: this,
                 });
-            } else if (this.m3u8Path.includes("dmm.com")) {
-                logger.info("Site comfirmed: DMM.");
-                const parser = await import("./parsers/dmm");
-                parser.default.parse({
-                    downloader: this,
-                });
             } else if (this.m3u8Path.includes("d22puzix29w08m")) {
                 logger.info("Site comfirmed: Hibiki-Radio.");
                 const parser = await import("./parsers/hibiki");
@@ -183,6 +177,7 @@ class ArchiveDownloader extends Downloader {
 
         try {
             await this.parse();
+            await this.checkKeys();
         } catch (e) {
             logger.error("Failed to parse M3U8 file.");
             logger.debug(e);
@@ -459,7 +454,7 @@ class ArchiveDownloader extends Downloader {
                     logger.info("End of merging.");
                     logger.info("Starting cleaning temporary files.");
                     try {
-                        await deleteDirectory(this.tempPath);
+                        await deleteDirectory(this.tempPath, this.outputFileList);
                     } catch (e) {
                         logger.warning(
                             `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
@@ -528,6 +523,7 @@ class ArchiveDownloader extends Downloader {
         await this.loadM3U8();
         try {
             await this.parse();
+            await this.checkKeys();
         } catch (e) {
             logger.error("Fail to parse M3U8 file.");
             logger.debug(e);
