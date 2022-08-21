@@ -13,7 +13,7 @@ export const deleteDirectory = (directoryPath: string, fileList: string[] = []) 
             fs.unlinkSync(path.resolve(directoryPath, filename));
         } catch (e) {
             logger.debug(e);
-            logger.warning(`Delete ${path.resolve(directoryPath, filename)} failed, ignored`);
+            logger.debug(`Delete ${path.resolve(directoryPath, filename)} failed, ignored`);
         }
     }
     if (fs.readdirSync(directoryPath).length === 0) {
