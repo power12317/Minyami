@@ -3,8 +3,8 @@ import { URL } from "url";
 import * as crypto from "crypto";
 import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
 import { exec } from "./system";
-import { getAvailableOutputPath } from "./common";
-import ProxyAgentHelper from "./agent";
+import ProxyAgentHelper from "../utils/agent";
+import CommonUtils from "./common";
 
 /**
  * 合并视频文件
@@ -12,7 +12,7 @@ import ProxyAgentHelper from "./agent";
  * @param output 输出路径
  */
 export function mergeToMKV(fileList = [], output = "./output.mkv") {
-    const outputPath = getAvailableOutputPath(output);
+    const outputPath = CommonUtils.getAvailableOutputPath(output);
     return new Promise<string>(async (resolve) => {
         if (fileList.length === 0) {
             return;
@@ -33,7 +33,7 @@ export function mergeToMKV(fileList = [], output = "./output.mkv") {
 
 export function mergeToTS(fileList = [], output = "./output.ts") {
     const cliProgress = require("cli-progress");
-    const outputPath = getAvailableOutputPath(output);
+    const outputPath = CommonUtils.getAvailableOutputPath(output);
     return new Promise<string>(async (resolve) => {
         if (fileList.length === 0) {
             resolve(outputPath);
@@ -149,7 +149,7 @@ export async function requestRaw(url: string, options: AxiosRequestConfig = {}):
  * @param key in hex
  * @param iv in hex
  */
-export function decrypt(input: string, output: string, key: string, iv: string, keepEncryptedChunks = false) {
+export function decrypt(input: string, output: string, key: string, iv: string) {
     return new Promise<void>((resolve) => {
         const algorithm = "aes-128-cbc";
         if (key.length !== 32) {
@@ -170,8 +170,8 @@ export function decrypt(input: string, output: string, key: string, iv: string, 
         const i = fs.createReadStream(input);
         const o = fs.createWriteStream(output);
         const pipe = i.pipe(decipher).pipe(o);
-        pipe.on("finish", () => {
-            !keepEncryptedChunks && fs.unlinkSync(input);
+        pipe.on("finish",  () => {
+            fs.unlinkSync(input);
             resolve();
         });
     });

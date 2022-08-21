@@ -1,15 +1,16 @@
 import * as path from "path";
+import * as fs from "fs";
+import { URL } from "url";
 import axios, { AxiosRequestConfig } from "axios";
 import { EventEmitter } from "events";
 import logger from "../utils/log";
 import { loadM3U8 } from "../utils/m3u8";
-import { buildFullUrl, getAvailableOutputPath, getFileExt } from "../utils/common";
-import { deleteDirectory } from "../utils/system";
+import * as system from "../utils/system";
+import CommonUtils from "../utils/common";
 import { download, decrypt } from "../utils/media";
 import ProxyAgentHelper from "../utils/agent";
 import UA from "../constants/ua";
-import FileConcentrator, { TaskStatus } from "./file_concentrator";
-import { isInitialChunk, M3U8Chunk, MasterPlaylist, Playlist } from "./m3u8";
+import { EncryptedM3U8Chunk, M3U8Chunk, MasterPlaylist, Playlist } from "./m3u8";
 import type { ActionType } from "./action";
 import * as actions from "./action";
 
@@ -24,7 +25,6 @@ export interface DownloaderConfig {
     proxy?: string;
     format?: string;
     nomerge?: boolean;
-    keepEncryptedChunks?: boolean;
     cliMode?: boolean;
 }
 
@@ -34,27 +34,32 @@ export interface ArchiveDownloaderConfig extends DownloaderConfig {
 
 export interface LiveDownloaderConfig extends DownloaderConfig {}
 
-export interface DownloadTask {
+export interface Chunk {
+    url: string;
     filename: string;
-    parentGroup?: DownloadTaskGroup;
-    retryCount: number;
-    chunk: M3U8Chunk;
+    isEncrypted: boolean;
+    parentGroup?: ChunkGroup;
+    key?: string;
+    iv?: string;
+    length: number;
+    sequenceId?: number;
+    retryCount?: number;
 }
 
-export interface DownloadTaskGroupAction {
+export interface ChunkAction {
     actionName: ActionType;
     actionParams: string;
 }
 
-export interface DownloadTaskGroup {
-    subTasks: DownloadTask[];
-    actions?: DownloadTaskGroupAction[];
+export interface ChunkGroup {
+    chunks: Chunk[];
+    actions?: ChunkAction[];
     isFinished: boolean;
     isNew: boolean;
     retryActions?: boolean;
 }
 
-export type DownloadTaskItem = DownloadTask | DownloadTaskGroup;
+export type ChunkItem = Chunk | ChunkGroup;
 
 export interface OnKeyUpdatedParams {
     keyUrls: string[];
@@ -63,8 +68,8 @@ export interface OnKeyUpdatedParams {
     saveEncryptionKey: (url: string, key: string) => void;
 }
 
-export function isTaskGroup(c: DownloadTaskItem): c is DownloadTaskGroup {
-    return !!(c as DownloadTaskGroup).subTasks;
+export function isChunkGroup(c: ChunkItem): c is ChunkGroup {
+    return !!(c as ChunkGroup).chunks;
 }
 
 class Downloader extends EventEmitter {
@@ -83,13 +88,14 @@ class Downloader extends EventEmitter {
     /** 并发数量 */
     threads: number = 5;
 
-    downloadTasks: DownloadTaskItem[];
-    allDownloadTasks: DownloadTaskItem[];
+    allChunks: ChunkItem[];
+    chunks: ChunkItem[];
+    pickedChunks: ChunkItem[];
 
     /** Cookies */
     cookies: string;
     /** HTTP Headers */
-    headers: Record<string, string> = {};
+    headers: object = {};
     key: string;
 
     /** 是否打印调试信息 */
@@ -122,16 +128,12 @@ class Downloader extends EventEmitter {
 
     encryptionKeys = {};
 
-    keepEncryptedChunks = false;
-
-    fileConcentrator: FileConcentrator;
-
-    taskStatusRecord: TaskStatus[] = [];
-
     // Hooks
-    protected onChunkNaming: (chunk: M3U8Chunk) => string = (chunk) => {
-        const ext = getFileExt(chunk.url);
-        return `${chunk.primaryKey.toString().padStart(6, "0")}${ext ? `.${ext}` : ""}`;
+    protected onChunkNaming: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string = (chunk) => {
+        return new URL(chunk.url).pathname
+            .split("/")
+            .slice(-1)[0]
+            .slice(8 - 255);
     };
 
     protected async onKeyUpdated({ keyUrls, explicitKeys, saveEncryptionKey }: OnKeyUpdatedParams) {}
@@ -150,7 +152,6 @@ class Downloader extends EventEmitter {
             headers,
             nomerge,
             cliMode = false,
-            keepEncryptedChunks,
         }: DownloaderConfig = {
             threads: 5,
         }
@@ -197,17 +198,16 @@ class Downloader extends EventEmitter {
                     }
                 }
             }
+            // Apply global custom headers
+            axios.defaults.headers.common = {
+                ...axios.defaults.headers.common,
+                ...{
+                    "User-Agent": UA.CHROME_DEFAULT_UA,
+                },
+                ...(this.cookies ? { Cookie: this.cookies } : {}), // Cookies 优先级低于 Custom Headers
+                ...this.headers,
+            };
         }
-
-        // Apply global custom headers
-        axios.defaults.headers.common = {
-            ...axios.defaults.headers.common,
-            ...{
-                "User-Agent": UA.CHROME_DEFAULT_UA,
-            },
-            ...(this.cookies ? { Cookie: this.cookies } : {}), // Cookies 优先级低于 Custom Headers
-            ...this.headers,
-        };
 
         if (proxy) {
             this.proxy = proxy;
@@ -218,15 +218,6 @@ class Downloader extends EventEmitter {
 
         if (nomerge) {
             this.noMerge = nomerge;
-            logger.info("Temporary files will not be deleted automatically.");
-        }
-
-        if (keepEncryptedChunks) {
-            this.keepEncryptedChunks = keepEncryptedChunks;
-            logger.info("Encrypted chunks will not be deleted automatically.");
-            if (!this.noMerge) {
-                logger.warning(`--keep-encrypted-chunks should be used with --keep.`);
-            }
         }
 
         this.m3u8Path = m3u8Path;
@@ -236,15 +227,6 @@ class Downloader extends EventEmitter {
                 `Output file name ends with .mkv is not supported in direct muxing mode, auto changing to .ts.`
             );
             this.outputPath = this.outputPath + ".ts";
-        }
-
-        if (!this.noMerge) {
-            this.outputPath = getAvailableOutputPath(this.outputPath);
-            this.fileConcentrator = new FileConcentrator({
-                outputPath: this.outputPath,
-                taskStatusRecord: this.taskStatusRecord,
-                deleteAfterWritten: true,
-            });
         }
 
         this.cliMode = cliMode;
@@ -269,29 +251,24 @@ class Downloader extends EventEmitter {
      */
     async init() {
         await this.loadM3U8();
-        this.totalChunkLength = this.m3u8.getTotalChunkLength();
     }
 
     async loadM3U8() {
         try {
-            const m3u8 = await loadM3U8({
-                path: this.m3u8Path,
-                retries: this.retries,
-                timeout: this.timeout,
-            });
+            const m3u8 = await loadM3U8(this.m3u8Path, this.retries, this.timeout);
             if (m3u8 instanceof MasterPlaylist) {
                 const streams = m3u8.streams;
                 const bestStream = streams.sort((a, b) => b.bandwidth - a.bandwidth)[0];
                 logger.info("Master playlist input detected. Auto selecting best quality streams.");
                 logger.debug(`Best stream: ${bestStream.url}; Bandwidth: ${bestStream.bandwidth}`);
-                this.m3u8 = (await loadM3U8({
-                    path: bestStream.url,
-                    retries: this.retries,
-                    timeout: this.timeout,
-                })) as Playlist;
+                this.m3u8 = (await loadM3U8(bestStream.url, this.retries, this.timeout)) as Playlist;
             } else {
                 this.m3u8 = m3u8;
             }
+            this.totalChunkLength = this.m3u8.chunks.reduce(
+                (prevLength, currentChunk) => prevLength + currentChunk.length,
+                0
+            );
         } catch (e) {
             logger.error("Aborted due to critical error.", e);
             this.emit("critical-error", e);
@@ -301,7 +278,7 @@ class Downloader extends EventEmitter {
     async checkKeys() {
         if (this.m3u8.encryptKeys.length > 0) {
             const newKeys = this.m3u8.encryptKeys.filter(
-                (key) => !this.getEncryptionKey(buildFullUrl(this.m3u8.m3u8Url, key))
+                (key) => !this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, key))
             );
             if (newKeys.length > 0) {
                 await this.onKeyUpdated({
@@ -320,7 +297,7 @@ class Downloader extends EventEmitter {
     async clean() {
         try {
             logger.info("Starting cleaning temporary files.");
-            await deleteDirectory(this.tempPath, this.outputFileList);
+            await system.deleteDirectory(this.tempPath, this.outputFileList);
         } catch (e) {
             logger.warning(
                 `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
@@ -332,32 +309,26 @@ class Downloader extends EventEmitter {
      * 处理块下载任务
      * @param task 块下载任务
      */
-    handleTask(task: DownloadTask) {
-        logger.debug(`Downloading ${task.chunk.url}`);
+    handleTask(task: Chunk) {
+        logger.debug(`Downloading ${task.url}`);
         const options: AxiosRequestConfig = {};
         options.timeout = Math.min(((task.retryCount || 0) + 1) * this.chunkTimeout, this.chunkTimeout * 5);
         return new Promise<void>(async (resolve, reject) => {
             logger.debug(`Downloading ${task.filename}`);
             try {
-                await download(task.chunk.url, path.resolve(this.tempPath, `./${task.filename}`), options);
+                await download(task.url, path.resolve(this.tempPath, `./${task.filename}`), options);
                 logger.debug(`Downloading ${task.filename} succeed.`);
-                if (task.chunk.isEncrypted) {
-                    const decryptIV = isInitialChunk(task.chunk)
-                        ? task.chunk.iv
-                        : task.chunk.iv || task.chunk.sequenceId.toString(16);
+                if (task.isEncrypted) {
                     await decrypt(
                         path.resolve(this.tempPath, `./${task.filename}`),
                         path.resolve(this.tempPath, `./${task.filename}`) + ".decrypt",
-                        this.getEncryptionKey(buildFullUrl(this.m3u8.m3u8Url, task.chunk.key)),
-                        decryptIV,
-                        this.keepEncryptedChunks
+                        this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, task.key)),
+                        task.iv || task.sequenceId.toString(16)
                     );
                     logger.debug(`Decrypting ${task.filename} succeed`);
                 }
                 this.finishedChunkCount++;
-                if (!isInitialChunk(task.chunk)) {
-                    this.finishedChunkLength += task.chunk.length;
-                }
+                this.finishedChunkLength += task.length;
                 resolve();
             } catch (e) {
                 logger.warning(
@@ -375,7 +346,7 @@ class Downloader extends EventEmitter {
         });
     }
 
-    async handleChunkGroupAction(action: DownloadTaskGroupAction) {
+    async handleChunkGroupAction(action: ChunkAction) {
         try {
             switch (action.actionName) {
                 case "ping": {
@@ -406,7 +377,7 @@ class Downloader extends EventEmitter {
         return this.encryptionKeys[url];
     }
 
-    setOnChunkNaming(handler: (chunk: M3U8Chunk) => string) {
+    setOnChunkNaming(handler: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string) {
         this.onChunkNaming = handler;
     }
 

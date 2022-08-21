@@ -60,9 +60,12 @@ Erii.bind(
             logger.enableDebugMode();
         }
         ProxyAgent.readProxyConfigurationFromEnv();
-        const downloadOptions = Object.assign(options, { cliMode: true, logger });
         if (options.live) {
-            const downloader = new LiveDownloader(path, downloadOptions);
+            const downloader = new LiveDownloader(path, {
+                ...options,
+                cliMode: true,
+                logger,
+            });
             downloader.on("finished", () => {
                 process.exit();
             });
@@ -71,7 +74,11 @@ Erii.bind(
             });
             await downloader.download();
         } else {
-            const downloader = new ArchiveDownloader(path, downloadOptions);
+            const downloader = new ArchiveDownloader(path, {
+                ...options,
+                cliMode: true,
+                logger,
+            });
             downloader.on("finished", () => {
                 process.exit();
             });
@@ -269,12 +276,6 @@ Erii.addOption({
     name: ["nomerge", "keep"],
     command: "download",
     description: "Do not merge m3u8 chunks.",
-});
-
-Erii.addOption({
-    name: ["keep-encrypted-chunks"],
-    command: "download",
-    description: "Do not delete encrypted chunks after decryption.",
 });
 
 Erii.default(() => {

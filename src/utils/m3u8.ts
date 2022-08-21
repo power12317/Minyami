@@ -1,18 +1,11 @@
 import * as fs from "fs";
 import { URL } from "url";
-import axios from "axios";
+import axios, { AxiosRequestConfig } from "axios";
 import M3U8 from "../core/m3u8";
 import ProxyAgentHelper from "../utils/agent";
 import logger from "../utils/log";
 
-interface LoadM3U8Options {
-    path: string;
-    retries?: number;
-    timeout?: number;
-    initPrimaryKey?: number;
-}
-
-export async function loadM3U8({ path, retries = 1, timeout = 60000, initPrimaryKey }: LoadM3U8Options) {
+export async function loadM3U8(path: string, retries: number = 1, timeout = 60000, options: AxiosRequestConfig = {}) {
     const proxyAgent = ProxyAgentHelper.getProxyAgentInstance();
     let m3u8Content;
     if (path.startsWith("http")) {
@@ -32,6 +25,7 @@ export async function loadM3U8({ path, retries = 1, timeout = 60000, initPrimary
                         Host: new URL(path).host,
                     },
                     cancelToken: source.token,
+                    ...options,
                 });
                 logger.info("M3U8 file fetched.");
                 m3u8Content = response.data;
@@ -57,7 +51,7 @@ export async function loadM3U8({ path, retries = 1, timeout = 60000, initPrimary
                 source = null;
             }
         }
-        const m3u8 = new M3U8({ m3u8Content, m3u8Url: path, initPrimaryKey });
+        const m3u8 = new M3U8({ m3u8Content, m3u8Url: path });
         return m3u8.parse();
     } else {
         // is a local file path

@@ -2,31 +2,26 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import axios from "axios";
-import { deleteEmptyDirectory } from "../utils/system";
+import { mergeToMKV, mergeToTS } from "../utils/media";
+import { deleteDirectory } from "../utils/system";
 import { saveTask, deleteTask, getTask } from "../utils/task";
 import { timeStringToSeconds } from "../utils/time";
 import logger from "../utils/log";
-import { isInitialChunk, Playlist } from "./m3u8";
-import Downloader, {
-    ArchiveDownloaderConfig,
-    DownloadTaskItem,
-    isTaskGroup,
-    DownloadTask,
-    DownloadTaskGroup,
-} from "./downloader";
-import { getFileExt } from "../utils/common";
-import { TaskStatus } from "./file_concentrator";
+import { Playlist } from "./m3u8";
+import Downloader, { ArchiveDownloaderConfig, ChunkItem, isChunkGroup, Chunk, ChunkGroup } from "./downloader";
 
 class ArchiveDownloader extends Downloader {
     tempPath: string;
     m3u8Path: string;
     m3u8: Playlist;
 
-    downloadTasks: DownloadTaskItem[] = [];
-    allDownloadTasks: DownloadTaskItem[] = [];
+    chunks: ChunkItem[] = [];
+    allChunks: ChunkItem[] = [];
+    pickedChunks: ChunkItem[] = [];
     // 使用 Object 的原因是使用数组，检索需要遍历数组 1/2 * n^2 次
     // 当有数千块的时候有那么一点点不可接受
     finishedFilenames: { [index: string]: any } = {};
+    outputFileList: string[];
 
     totalChunksCount: number;
     runningThreads: number = 0;
@@ -59,7 +54,6 @@ class ArchiveDownloader extends Downloader {
             cookies,
             headers,
             nomerge,
-            keepEncryptedChunks,
             cliMode,
         }: ArchiveDownloaderConfig = {}
     ) {
@@ -74,7 +68,6 @@ class ArchiveDownloader extends Downloader {
             cookies,
             headers,
             nomerge,
-            keepEncryptedChunks,
             cliMode,
         });
         if (slice) {
@@ -129,33 +122,20 @@ class ArchiveDownloader extends Downloader {
             // Not encrypted
             if (this.m3u8Path.includes("dmc.nico")) {
                 // NicoNico
-                if (this.m3u8.m3u8Content.includes("#EXT-X-PLAYLIST-TYPE:VOD")) {
-                    logger.info("Site comfirmed: NicoVideo.");
-                    try {
-                        const parser = await import("./parsers/common");
-                        await parser.default.parse({
-                            downloader: this,
-                        });
-                    } catch (e) {
-                        logger.error("Aborted due to critical error.", e);
-                        this.emit("critical-error", e);
-                    }
-                } else {
-                    logger.info("Site comfirmed: NicoLive.");
-                    const parser = await import("./parsers/nico");
-                    if (!this.key) {
-                        logger.info("请保持播放页面不要关闭");
-                        logger.info("Please do not close the video page.");
-                        logger.info(`Maybe you should get a audience token to get a better user experience.`);
-                    }
-                    if (this.threads > 10) {
-                        logger.warning(`High threads setting detected. Use at your own risk!`);
-                    }
-                    parser.default.parse({
-                        downloader: this,
-                    });
-                    this.autoGenerateChunkList = false;
+                logger.info("Site comfirmed: NicoNico.");
+                const parser = await import("./parsers/nico");
+                if (!this.key) {
+                    logger.info("请保持播放页面不要关闭");
+                    logger.info("Please do not close the video page.");
+                    logger.info(`Maybe you should get a audience token to get a better user experience.`);
                 }
+                if (this.threads > 10) {
+                    logger.warning(`High threads setting detected. Use at your own risk!`);
+                }
+                parser.default.parse({
+                    downloader: this,
+                });
+                this.autoGenerateChunkList = false;
             } else if (this.m3u8Path.includes("googlevideo")) {
                 // YouTube
                 logger.info("Site comfirmed: YouTube.");
@@ -206,28 +186,37 @@ class ArchiveDownloader extends Downloader {
 
         logger.info(`Start downloading with ${this.threads} thread(s).`);
         if (this.autoGenerateChunkList) {
-            this.downloadTasks = this.m3u8.chunks.map((chunk, index) => {
-                const ext = getFileExt(chunk.url);
-                const sequenceNumber = index;
-                return {
-                    url: chunk.url,
-                    filename: `${sequenceNumber}${ext ? `.${ext}` : ""}`,
-                    retryCount: 0,
-                    chunk,
-                    sequenceNumber,
-                };
+            this.chunks = this.m3u8.chunks.map((chunk) => {
+                const filename = this.onChunkNaming(chunk);
+                return chunk.isEncrypted
+                    ? {
+                          url: chunk.url,
+                          filename,
+                          key: chunk.key,
+                          iv: chunk.iv,
+                          sequenceId: chunk.sequenceId,
+                          isEncrypted: true,
+                          length: chunk.length,
+                      }
+                    : {
+                          url: chunk.url,
+                          filename,
+                          sequenceId: chunk.sequenceId,
+                          isEncrypted: false,
+                          length: chunk.length,
+                      };
             });
         }
         if (this.sliceStart !== undefined && this.sliceEnd !== undefined) {
-            const newChunkList: DownloadTaskItem[] = [];
+            const newChunkList: ChunkItem[] = [];
             let nowTime = 0;
-            for (const task of this.downloadTasks) {
+            for (const chunk of this.chunks) {
                 if (nowTime > this.sliceEnd) {
                     break;
                 }
-                if (isTaskGroup(task)) {
-                    const chunkGroupTotalLength = task.subTasks.reduce(
-                        (prevLength, t) => prevLength + (isInitialChunk(t.chunk) ? 0 : t.chunk.length),
+                if (isChunkGroup(chunk)) {
+                    const chunkGroupTotalLength = chunk.chunks.reduce(
+                        (prevLength, chunk) => prevLength + chunk.length,
                         0
                     );
                     // 处理一组块
@@ -237,66 +226,73 @@ class ArchiveDownloader extends Downloader {
                         continue;
                     } else {
                         // 组中至少有一个已经在时间范围内
-                        const newChunkItem: DownloadTaskItem = {
-                            actions: task.actions,
-                            subTasks: [],
+                        const newChunkItem: ChunkItem = {
+                            actions: chunk.actions,
+                            chunks: [],
                             isFinished: false,
                             isNew: true,
                         };
-                        for (const t of task.subTasks) {
-                            if (isInitialChunk(t.chunk)) {
-                                newChunkItem.subTasks.push(t);
-                                continue;
-                            }
-                            if (
-                                nowTime + t.chunk.length >= this.sliceStart &&
-                                nowTime + t.chunk.length < this.sliceEnd
-                            ) {
+                        for (const c of chunk.chunks) {
+                            if (nowTime + c.length >= this.sliceStart && nowTime + c.length < this.sliceEnd) {
                                 // 添加已经在时间范围内的块
-                                newChunkItem.subTasks.push(t);
-                                nowTime += t.chunk.length;
+                                newChunkItem.chunks.push(c);
+                                nowTime += c.length;
                             } else {
                                 // 跳过时间范围外的块
-                                nowTime += t.chunk.length;
+                                nowTime += c.length;
                                 continue;
                             }
                         }
                         newChunkList.push(newChunkItem);
                     }
                 } else {
-                    if (isInitialChunk(task.chunk)) {
-                        newChunkList.push(task);
+                    // 处理普通块
+                    if (nowTime >= this.sliceStart) {
+                        newChunkList.push(chunk);
+                        nowTime += chunk.length;
                     } else {
-                        // 处理普通块
-                        if (nowTime >= this.sliceStart) {
-                            newChunkList.push(task);
-                            nowTime += task.chunk.length;
-                        } else {
-                            nowTime += task.chunk.length;
-                        }
+                        nowTime += chunk.length;
                     }
                 }
             }
 
-            this.downloadTasks = newChunkList;
+            this.chunks = newChunkList;
         }
 
-        this.allDownloadTasks = this.downloadTasks.map((task) => {
-            if (isTaskGroup(task)) {
+        this.allChunks = this.chunks.map((chunk) => {
+            if (isChunkGroup(chunk)) {
                 return {
-                    ...task,
-                    subTasks: [...task.subTasks],
+                    ...chunk,
+                    chunks: [...chunk.chunks],
                 };
             } else {
-                return task;
+                return chunk;
             }
         });
 
         this.totalChunksCount = 0;
-        for (const chunk of this.downloadTasks) {
-            this.totalChunksCount += isTaskGroup(chunk) ? chunk.subTasks.length : 1;
+        for (const chunk of this.chunks) {
+            this.totalChunksCount += isChunkGroup(chunk) ? chunk.chunks.length : 1;
         }
 
+        this.outputFileList = [];
+        this.chunks.forEach((chunkItem) => {
+            if (!isChunkGroup(chunkItem)) {
+                if (chunkItem.isEncrypted) {
+                    this.outputFileList.push(path.resolve(this.tempPath, `./${chunkItem.filename}.decrypt`));
+                } else {
+                    this.outputFileList.push(path.resolve(this.tempPath, `./${chunkItem.filename}`));
+                }
+            } else {
+                for (const chunk of chunkItem.chunks) {
+                    if (chunk.isEncrypted) {
+                        this.outputFileList.push(path.resolve(this.tempPath, `./${chunk.filename}.decrypt`));
+                    } else {
+                        this.outputFileList.push(path.resolve(this.tempPath, `./${chunk.filename}`));
+                    }
+                }
+            }
+        });
         if (this.verbose) {
             setInterval(() => {
                 logger.debug(
@@ -330,46 +326,47 @@ class ArchiveDownloader extends Downloader {
      * Check task queue
      */
     async checkQueue() {
-        if (this.downloadTasks.length > 0 && this.runningThreads < this.threads) {
-            const firstTask = this.downloadTasks[0];
-            let task: DownloadTask;
-            if (isTaskGroup(firstTask)) {
-                if (firstTask.actions && firstTask.isNew) {
+        if (this.chunks.length > 0 && this.runningThreads < this.threads) {
+            const task = this.chunks[0];
+            let chunk: Chunk;
+            if (isChunkGroup(task)) {
+                if (task.actions && task.isNew) {
                     logger.debug(`Handle chunk actions for a new chunk group.`);
-                    firstTask.isNew = false;
-                    for (const action of firstTask.actions) {
+                    task.isNew = false;
+                    for (const action of task.actions) {
                         await this.handleChunkGroupAction(action);
                     }
                     this.checkQueue();
                     return;
                 }
-                if (firstTask.subTasks.length > 0) {
-                    task = firstTask.subTasks.shift();
-                    task.parentGroup = firstTask;
-                    if (task.parentGroup.retryActions) {
-                        for (const action of task.parentGroup.actions) {
+                if (task.chunks.length > 0) {
+                    chunk = task.chunks.shift();
+                    chunk.parentGroup = task;
+                    if (chunk.parentGroup.retryActions) {
+                        for (const action of chunk.parentGroup.actions) {
                             await this.handleChunkGroupAction(action);
                         }
-                        task.parentGroup.retryActions = false;
+                        chunk.parentGroup.retryActions = false;
                     }
                 } else {
                     // All chunks finished in group
                     logger.debug(`Skip a empty chunk group.`);
-                    firstTask.isFinished = true;
-                    this.downloadTasks.shift();
+                    task.isFinished = true;
+                    this.chunks.shift();
                     this.checkQueue();
                     return;
                 }
             } else {
-                task = this.downloadTasks.shift() as DownloadTask;
+                chunk = this.chunks.shift() as Chunk;
                 // this.chunks.shift();
             }
+            this.pickedChunks.push(chunk);
             this.runningThreads++;
-            this.handleTask(task)
+            this.handleTask(chunk)
                 .then(() => {
                     this.runningThreads--;
                     const currentChunkInfo = {
-                        taskname: task.filename,
+                        taskname: chunk.filename,
                         finishedChunksCount: this.finishedChunkCount,
                         totalChunksCount: this.totalChunksCount,
                         chunkSpeed: this.calculateSpeedByChunk(),
@@ -387,43 +384,40 @@ class ArchiveDownloader extends Downloader {
                             currentChunkInfo.ratioSpeed
                         }x | ETA: ${currentChunkInfo.eta})`
                     );
-                    this.finishedFilenames[task.filename] = true;
-                    this.fileConcentrator.addTasks([
-                        {
-                            filePath: task.chunk.isEncrypted
-                                ? path.resolve(this.tempPath, `./${task.filename}.decrypt`)
-                                : path.resolve(this.tempPath, `./${task.filename}`),
-                            index: task.chunk.primaryKey,
-                        },
-                    ]);
-                    this.taskStatusRecord[task.chunk.primaryKey] = TaskStatus.DONE;
+                    this.finishedFilenames[chunk.filename] = true;
                     this.emit("chunk-downloaded", currentChunkInfo);
                     this.checkQueue();
                 })
                 .catch((e) => {
-                    this.emit("chunk-error", e, task.filename);
+                    this.emit("chunk-error", e, chunk.filename);
                     this.runningThreads--;
                     // 重试计数
-                    if (task.retryCount) {
-                        task.retryCount++;
+                    if (chunk.retryCount) {
+                        chunk.retryCount++;
                     } else {
-                        task.retryCount = 1;
+                        chunk.retryCount = 1;
                     }
-                    if (task.parentGroup) {
-                        if (task.parentGroup.isFinished) {
-                            // Add a new group to the queue.
-                            this.downloadTasks.push({
-                                subTasks: [task],
-                                actions: task.parentGroup.actions,
-                                isFinished: false,
-                                isNew: true,
-                            } as DownloadTaskGroup);
+
+                    if(chunk.retryCount >20){//单chunk 20次都失败 放弃
+                        logger.warning(`Dropping chunk ${chunk.filename} , max retries exceeded.`);
+                        this.outputFileList = this.outputFileList.filter((c) => !c.includes(chunk.filename))
+                    }else{
+                        if (chunk.parentGroup) {
+                            if (chunk.parentGroup.isFinished) {
+                                // Add a new group to the queue.
+                                this.chunks.push({
+                                    chunks: [chunk],
+                                    actions: chunk.parentGroup.actions,
+                                    isFinished: false,
+                                    isNew: true,
+                                } as ChunkGroup);
+                            } else {
+                                chunk.parentGroup.retryActions = true;
+                                chunk.parentGroup.chunks.push(chunk);
+                            }
                         } else {
-                            task.parentGroup.retryActions = true;
-                            task.parentGroup.subTasks.push(task);
+                            this.chunks.push(chunk);
                         }
-                    } else {
-                        this.downloadTasks.push(task);
                     }
                     
                     this.checkQueue();
@@ -437,7 +431,7 @@ class ArchiveDownloader extends Downloader {
         }
 
         if (
-            this.downloadTasks.length === 0 &&
+            this.chunks.length === 0 &&
             this.totalChunksCount === this.finishedChunkCount &&
             this.runningThreads === 0
         ) {
@@ -446,42 +440,41 @@ class ArchiveDownloader extends Downloader {
             }
             this.isDownloaded = true;
             logger.info("All chunks downloaded. Start merging chunks.");
+            const muxer = this.format === "ts" ? mergeToTS : mergeToMKV;
+            // Save before merge
             this.emit("downloaded");
             this.saveTask();
             if (this.noMerge) {
                 logger.info("Skip merging. Please merge video chunks manually.");
                 logger.info(`Temporary files are located at ${this.tempPath}`);
                 this.emit("finished");
-                return;
             }
-            logger.info("Merging chunks...");
-            await this.fileConcentrator.waitAllFilesWritten();
-            logger.info("End of merging.");
-            logger.info("Starting cleaning temporary files.");
-            try {
-                await deleteEmptyDirectory(this.tempPath);
-            } catch (e) {
-                logger.warning(
-                    `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
-                );
-            }
-            try {
-                deleteTask(this.m3u8Path.split("?")[0]);
-            } catch (error) {
-                logger.warning("Fail to parse previous tasks, ignored.");
-                logger.warning(error.message);
-            }
-            const outputPaths = this.fileConcentrator.getOutputFilePaths();
-            if (outputPaths.length === 1) {
-                logger.info(`All finished. Please checkout your files at [${path.resolve(outputPaths[0])}]`);
-            } else {
-                logger.info(
-                    `All finished. Please checkout your files at ${outputPaths
-                        .map((p) => `[${path.resolve(p)}]`)
-                        .join(", ")}.`
-                );
-            }
-            this.emit("finished");
+            muxer(this.outputFileList, this.outputPath)
+                .then(async (outputPath) => {
+                    logger.info("End of merging.");
+                    logger.info("Starting cleaning temporary files.");
+                    try {
+                        await deleteDirectory(this.tempPath, this.outputFileList);
+                    } catch (e) {
+                        logger.warning(
+                            `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
+                        );
+                    }
+                    try {
+                        deleteTask(this.m3u8Path.split("?")[0]);
+                    } catch (error) {
+                        logger.warning("Fail to parse previous tasks, ignored.");
+                        logger.warning(error.message);
+                    }
+                    logger.info(`All finished. Check your file at [${path.resolve(outputPath)}] .`);
+                    this.emit("finished");
+                })
+                .catch(async (e) => {
+                    await this.clean();
+                    this.emit("merge-error", e);
+                    logger.error("Fail to merge video. Please merge video chunks manually.", e);
+                    logger.error(`Your temporary files at located at [${path.resolve(this.tempPath)}]`);
+                });
         }
     }
 
@@ -514,8 +507,9 @@ class ArchiveDownloader extends Downloader {
         this.retries = previousTask.retries;
         this.timeout = previousTask.timeout;
         this.proxy = previousTask.proxy;
-        this.allDownloadTasks = previousTask.allDownloadTasks;
-        this.downloadTasks = previousTask.downloadTasks;
+        this.allChunks = previousTask.allChunks;
+        this.chunks = previousTask.chunks;
+        this.outputFileList = previousTask.outputFileList;
         this.finishedFilenames = previousTask.finishedFilenames;
         if (this.headers && Object.keys(this.headers).length > 0) {
             // Apply global custom headers
@@ -552,37 +546,37 @@ class ArchiveDownloader extends Downloader {
     }
 
     saveTask() {
-        const unfinishedTasks: DownloadTaskItem[] = [];
-        this.allDownloadTasks.forEach((task) => {
-            if (isTaskGroup(task)) {
+        const unfinishedChunks: ChunkItem[] = [];
+        this.allChunks.forEach((chunkItem) => {
+            if (isChunkGroup(chunkItem)) {
                 let allFinishedFlag = true;
-                const unfinishedTasksInGroup: DownloadTask[] = [];
-                for (const subTask of task.subTasks) {
-                    if (!this.finishedFilenames[subTask.filename]) {
+                const unfinishedChunksInItem: Chunk[] = [];
+                for (const chunk of chunkItem.chunks) {
+                    if (!this.finishedFilenames[chunk.filename]) {
                         allFinishedFlag = false;
-                        unfinishedTasksInGroup.push(subTask);
+                        unfinishedChunksInItem.push(chunk);
                     }
                 }
                 if (!allFinishedFlag) {
                     // 组中块未全部完成 加入未完成列表
-                    unfinishedTasks.push({
-                        ...task,
-                        subTasks: unfinishedTasksInGroup,
+                    unfinishedChunks.push({
+                        ...chunkItem,
+                        chunks: unfinishedChunksInItem,
                     });
                 }
             } else {
-                if (!this.finishedFilenames[task.filename]) {
-                    unfinishedTasks.push(task);
+                if (!this.finishedFilenames[chunkItem.filename]) {
+                    unfinishedChunks.push(chunkItem);
                 }
             }
         });
 
-        let unfinishedTaskCount = 0;
-        for (const task of unfinishedTasks) {
-            unfinishedTaskCount += isTaskGroup(task) ? task.subTasks.length : 1;
+        let unfinishedChunksLength = 0;
+        for (const chunk of unfinishedChunks) {
+            unfinishedChunksLength += isChunkGroup(chunk) ? chunk.chunks.length : 1;
         }
 
-        logger.info(`Downloaded: ${this.finishedChunkCount}; Waiting for download: ${unfinishedTaskCount}`);
+        logger.info(`Downloaded: ${this.finishedChunkCount}; Waiting for download: ${unfinishedChunksLength}`);
 
         try {
             saveTask({
@@ -596,14 +590,15 @@ class ArchiveDownloader extends Downloader {
                 key: this.key,
                 verbose: this.verbose,
                 startedAt: this.startedAt,
-                finishedChunksCount: this.totalChunksCount - unfinishedTaskCount,
+                finishedChunksCount: this.totalChunksCount - unfinishedChunksLength,
                 finishedChunkLength: this.finishedChunkLength,
                 totalChunksCount: this.totalChunksCount,
                 retries: this.retries,
                 timeout: this.timeout,
                 proxy: this.proxy,
-                downloadTasks: unfinishedTasks,
-                allDownloadTasks: this.allDownloadTasks,
+                allChunks: this.allChunks,
+                chunks: unfinishedChunks,
+                outputFileList: this.outputFileList,
                 finishedFilenames: this.finishedFilenames,
             });
         } catch (error) {
