@@ -3,30 +3,30 @@ const WebSocket = require("ws");
 import UA from "../../constants/ua";
 import logger from "../../utils/log";
 import ProxyAgentHelper from "../../utils/agent";
-import { isTaskGroup, DownloadTaskGroup } from "../downloader";
+import { isChunkGroup, ChunkGroup } from "../downloader";
 import { ParserOptions, ParserResult } from "./types";
 
 export default class Parser {
     static updateToken(token: string, downloader: ParserOptions["downloader"], host = undefined) {
         logger.info(`Update Token: ${token}`);
-        for (const chunk of downloader.allDownloadTasks) {
-            if (isTaskGroup(chunk)) {
-                for (const c of chunk.subTasks) {
-                    c.chunk.url = c.chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
+        for (const chunk of downloader.allChunks) {
+            if (isChunkGroup(chunk)) {
+                for (const c of chunk.chunks) {
+                    c.url = c.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
                     if (host) {
-                        c.chunk.url = c.chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
+                        c.url = c.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
                     }
                 }
             } else {
-                chunk.chunk.url = chunk.chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
+                chunk.url = chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
                 if (host) {
-                    chunk.chunk.url = chunk.chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
+                    chunk.url = chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
                 }
             }
         }
-        for (const task of downloader.downloadTasks) {
-            if (isTaskGroup(task)) {
-                task.actions.forEach((action) => {
+        for (const chunk of downloader.chunks) {
+            if (isChunkGroup(chunk)) {
+                chunk.actions.forEach((action) => {
                     if (action.actionName === "ping") {
                         action.actionParams = action.actionParams.replace(
                             /ht2_nicolive=([^\&]+)/,
@@ -37,19 +37,19 @@ export default class Parser {
                         }
                     }
                 });
-                for (const t of task.subTasks) {
-                    t.chunk.url = t.chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
+                for (const c of chunk.chunks) {
+                    c.url = c.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
                     if (host) {
-                        t.chunk.url = t.chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
+                        c.url = c.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
                     }
                 }
             } else {
-                task.chunk.url = task.chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
+                chunk.url = chunk.url.replace(/ht2_nicolive=([^\&]+)/, `ht2_nicolive=${token}`);
                 if (host) {
-                    task.chunk.url = task.chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
+                    chunk.url = chunk.url.replace(/(http(s):\/\/.+\/)(\d\/ts)/, `${host}$3`);
                 }
-                if (task.parentGroup) {
-                    task.parentGroup.actions.forEach((action) => {
+                if (chunk.parentGroup) {
+                    chunk.parentGroup.actions.forEach((action) => {
                         if (action.actionName === "ping") {
                             action.actionParams = action.actionParams.replace(
                                 /ht2_nicolive=([^\&]+)/,
@@ -140,7 +140,7 @@ export default class Parser {
         }
         const prefix = downloader.m3u8.m3u8Url.match(/^(.+\/)/)[1];
         if (downloader) {
-            if (downloader.downloadTasks.length === 0) {
+            if (downloader.chunks.length === 0) {
                 // 生成 Fake M3U8
                 const chunkLength = downloader.m3u8.getChunkLength();
                 const videoLength = parseFloat(downloader.m3u8.m3u8Content.match(/#DMC-STREAM-DURATION:(.+)/)[1]);
@@ -153,10 +153,9 @@ export default class Parser {
                 }
                 const suffix = downloader.m3u8.chunks[0].url.match(/\.ts(.+)/)[1];
                 const newChunkList = [];
-                let counter = 0;
-                let sequenceId = 0;
-                let chunkGroup: DownloadTaskGroup = {
-                    subTasks: [],
+                let counter: number = 0;
+                let chunkGroup: ChunkGroup = {
+                    chunks: [],
                     isFinished: false,
                     isNew: true,
                 };
@@ -172,7 +171,7 @@ export default class Parser {
                                     actionParams: pingUrl.replace("1/ts/playlist.m3u8", "master.m3u8"),
                                 },
                             ],
-                            subTasks: [],
+                            chunks: [],
                             isFinished: false,
                             isNew: true,
                         };
@@ -181,27 +180,20 @@ export default class Parser {
                         // 最后一块小于1秒 可能不存在
                         continue;
                     }
-                    chunkGroup.subTasks.push({
+                    chunkGroup.chunks.push({
+                        url:
+                            prefix +
+                            (time.toString() === "0"
+                                ? `0.ts${suffix.replace(/start=.+&/gi, `start=${0}&`)}`
+                                : `${time.toString()}${offset}.ts${suffix.replace(
+                                      /start=.+&/gi,
+                                      `start=${startTime}&`
+                                  )}`),
                         filename: `${time.toString()}${offset}.ts`,
-                        retryCount: 0,
-                        chunk: {
-                            isEncrypted: false,
-                            isInitialChunk: false,
-                            length: 5.0,
-                            sequenceId,
-                            primaryKey: sequenceId,
-                            url:
-                                prefix +
-                                (time.toString() === "0"
-                                    ? `0.ts${suffix.replace(/start=.+&/gi, `start=${0}&`)}`
-                                    : `${time.toString()}${offset}.ts${suffix.replace(
-                                          /start=.+&/gi,
-                                          `start=${startTime}&`
-                                      )}`),
-                        },
+                        isEncrypted: false,
+                        length: 5.0,
                     });
                     counter++;
-                    sequenceId++;
                     if (counter === 4) {
                         newChunkList.push(chunkGroup);
                         counter = 0;
@@ -211,7 +203,7 @@ export default class Parser {
                     newChunkList.push(chunkGroup);
                     counter = 0;
                 }
-                downloader.downloadTasks = newChunkList;
+                downloader.chunks = newChunkList;
             } else {
                 // 刷新 Token
                 const token = downloader.m3u8Path.match(/ht2_nicolive=(.+?)&/)[1];
