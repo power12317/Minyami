@@ -2,7 +2,7 @@ import { ParserOptions, ParserResult } from "./types";
 
 export default class Parser {
     static parse({ downloader }: ParserOptions): ParserResult {
-        downloader.setOnChunkNaming((chunk) => {
+        downloader.setOnTaskOutputFileNaming((chunk) => {
             const chunkIdMatch = chunk.url.match(/\/(\d+?)\/goap/);
             if (chunkIdMatch) {
                 return chunkIdMatch[1];

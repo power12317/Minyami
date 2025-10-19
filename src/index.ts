@@ -5,14 +5,10 @@ import * as path from "path";
 import Erii from "erii";
 import ArchiveDownloader from "./core/archive";
 import LiveDownloader from "./core/live";
-import { exec, deleteDirectory } from "./utils/system";
+import { exec, forceDeleteDirectory, readConfigFile } from "./utils/system";
 import logger from "./utils/log";
 import { timeStringToSeconds } from "./utils/time";
-import ProxyAgent from "./utils/agent";
-
-process.on("unhandledRejection", (error: Error) => {
-    console.error(error.name, error.message, error.stack);
-});
+import ProxyAgentHelper from "./utils/agent";
 
 Erii.setMetaInfo({
     version:
@@ -59,31 +55,43 @@ Erii.bind(
         if (options.verbose) {
             logger.enableDebugMode();
         }
-        ProxyAgent.readProxyConfigurationFromEnv();
+
+        const disableProxy = options.noProxy || process.env.NO_PROXY;
+
+        if (!disableProxy) {
+            if (process.platform === "win32") {
+                await ProxyAgentHelper.readWindowsSystemProxy();
+            }
+            ProxyAgentHelper.readProxyConfigurationFromEnv();
+        } else {
+            ProxyAgentHelper.disableProxy();
+        }
+        const fileOptions = readConfigFile();
+        if (Object.keys(fileOptions).length > 0) {
+            logger.debug(`Read config file: ${JSON.stringify(fileOptions)}`);
+        }
+        for (const key of Object.keys(fileOptions)) {
+            if (options[key] === undefined) {
+                options[key] = fileOptions[key];
+            }
+        }
+        const finalOptions = Object.assign(options, { cliMode: true, logger });
         if (options.live) {
-            const downloader = new LiveDownloader(path, {
-                ...options,
-                cliMode: true,
-                logger,
-            });
+            const downloader = new LiveDownloader(path, finalOptions);
             downloader.on("finished", () => {
                 process.exit();
             });
             downloader.on("critical-error", () => {
-                process.exit();
+                process.exit(1);
             });
             await downloader.download();
         } else {
-            const downloader = new ArchiveDownloader(path, {
-                ...options,
-                cliMode: true,
-                logger,
-            });
+            const downloader = new ArchiveDownloader(path, finalOptions);
             downloader.on("finished", () => {
                 process.exit();
             });
             downloader.on("critical-error", () => {
-                process.exit();
+                process.exit(1);
             });
             await downloader.init();
             await downloader.download();
@@ -102,6 +110,9 @@ Erii.bind(
     },
     async (ctx, options) => {
         const path = ctx.getArgument().toString();
+        if (options.verbose) {
+            logger.enableDebugMode();
+        }
         const downloader = new ArchiveDownloader(undefined, {
             cliMode: true,
         });
@@ -109,7 +120,7 @@ Erii.bind(
             process.exit();
         });
         downloader.on("critical-error", () => {
-            process.exit();
+            process.exit(1);
         });
         downloader.resume(path);
     }
@@ -120,10 +131,17 @@ Erii.bind(
         name: ["clean"],
         description: "Clean cache files",
     },
-    () => {
-        for (const file of fs.readdirSync(path.resolve(os.tmpdir()))) {
+    (ctx, options) => {
+        if (options.verbose) {
+            logger.enableDebugMode();
+        }
+        const fileOptions = readConfigFile();
+        if (Object.keys(fileOptions).length > 0) {
+            logger.debug(`Read config file: ${JSON.stringify(fileOptions)}`);
+        }
+        for (const file of fs.readdirSync(path.resolve(fileOptions.tempDir || os.tmpdir()))) {
             if (file.startsWith("minyami_")) {
-                deleteDirectory(path.resolve(os.tmpdir(), `./${file}`));
+                forceDeleteDirectory(path.resolve(os.tmpdir(), `./${file}`));
             }
         }
         fs.writeFileSync(path.resolve(__dirname, "../tasks.json"), "[]");
@@ -188,6 +206,16 @@ Erii.addOption({
 });
 
 Erii.addOption({
+    name: ["temp-dir"],
+    command: "download",
+    description: "Temporary file path",
+    argument: {
+        name: "path",
+        description: "(Optional) Temporary file path, defaults to env.TEMP",
+    },
+});
+
+Erii.addOption({
     name: ["key"],
     command: "download",
     description: "Set key manually (Internal use)",
@@ -247,6 +275,12 @@ Erii.addOption({
 });
 
 Erii.addOption({
+    name: ["no-proxy"],
+    command: "download",
+    description: "Disable reading proxy configuration from system environment variables or system settings.",
+});
+
+Erii.addOption({
     name: ["slice"],
     command: "download",
     description: "Download specified part of the stream",
@@ -273,9 +307,27 @@ Erii.addOption({
 });
 
 Erii.addOption({
-    name: ["nomerge", "keep"],
+    name: ["no-merge"],
     command: "download",
     description: "Do not merge m3u8 chunks.",
+});
+
+Erii.addOption({
+    name: ["keep", "k"],
+    command: "download",
+    description: "Keep temporary files.",
+});
+
+Erii.addOption({
+    name: ["keep-encrypted-chunks"],
+    command: "download",
+    description: "Do not delete encrypted chunks after decryption.",
+});
+
+Erii.addOption({
+    name: ["chunk-naming-strategy"],
+    command: "download",
+    description: "Temporary file naming strategy. Defaults to 1.",
 });
 
 Erii.default(() => {

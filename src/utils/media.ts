@@ -3,8 +3,8 @@ import { URL } from "url";
 import * as crypto from "crypto";
 import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
 import { exec } from "./system";
-import ProxyAgentHelper from "../utils/agent";
-import CommonUtils from "./common";
+import { getAvailableOutputPath } from "./common";
+import ProxyAgentHelper from "./agent";
 
 /**
  * 合并视频文件
@@ -12,7 +12,7 @@ import CommonUtils from "./common";
  * @param output 输出路径
  */
 export function mergeToMKV(fileList = [], output = "./output.mkv") {
-    const outputPath = CommonUtils.getAvailableOutputPath(output);
+    const outputPath = getAvailableOutputPath(output);
     return new Promise<string>(async (resolve) => {
         if (fileList.length === 0) {
             return;
@@ -33,7 +33,7 @@ export function mergeToMKV(fileList = [], output = "./output.mkv") {
 
 export function mergeToTS(fileList = [], output = "./output.ts") {
     const cliProgress = require("cli-progress");
-    const outputPath = CommonUtils.getAvailableOutputPath(output);
+    const outputPath = getAvailableOutputPath(output);
     return new Promise<string>(async (resolve) => {
         if (fileList.length === 0) {
             resolve(outputPath);
@@ -54,13 +54,7 @@ export function mergeToTS(fileList = [], output = "./output.ts") {
         function write() {
             writable = true;
             while (i <= lastIndex && writable) {
-                const temp_i = i;
                 writable = writeStream.write(fs.readFileSync(fileList[i]), () => {
-                    try{
-                        fs.unlink(fileList[temp_i],()=>{});
-                    }catch(e){
-                        console.log(e);
-                    }
                     if (i > lastIndex) {
                         bar.update(i);
                         bar.stop();
@@ -101,7 +95,7 @@ export function download(url: string, path: string, options: AxiosRequestConfig 
                 responseType: "arraybuffer",
                 httpsAgent: proxyAgentInstance ? proxyAgentInstance : undefined,
                 headers: {
-                    Host: new URL(url).host,
+                    ...(!axios.defaults.headers.common["Host"] ? { Host: new URL(url).host } : {}),
                 },
                 cancelToken: source.token,
                 ...options,
@@ -112,7 +106,9 @@ export function download(url: string, path: string, options: AxiosRequestConfig 
             ) {
                 reject(new Error("Bad Response"));
             }
-            fs.writeFileSync(path, response.data);
+            const tempPath = path + ".t";
+            fs.writeFileSync(tempPath, response.data);
+            fs.renameSync(tempPath, path);
             resolve();
         } catch (e) {
             reject(e);
@@ -149,8 +145,8 @@ export async function requestRaw(url: string, options: AxiosRequestConfig = {}):
  * @param key in hex
  * @param iv in hex
  */
-export function decrypt(input: string, output: string, key: string, iv: string) {
-    return new Promise((resolve) => {
+export function decrypt(input: string, output: string, key: string, iv: string, keepEncryptedChunks = false) {
+    return new Promise<void>((resolve) => {
         const algorithm = "aes-128-cbc";
         if (key.length !== 32) {
             throw new Error(`Key [${key}] length [${key.length}] or form invalid.`);
@@ -168,11 +164,13 @@ export function decrypt(input: string, output: string, key: string, iv: string) 
 
         const decipher = crypto.createDecipheriv(algorithm, keyBuffer, ivBuffer);
         const i = fs.createReadStream(input);
-        const o = fs.createWriteStream(output);
+        const tempOutput = output + ".t";
+        const o = fs.createWriteStream(tempOutput);
         const pipe = i.pipe(decipher).pipe(o);
-        pipe.on("finish",  ()=>{
-            fs.unlinkSync(input);
-            resolve(null);
+        pipe.on("close", () => {
+            !keepEncryptedChunks && fs.unlinkSync(input);
+            fs.renameSync(tempOutput, output);
+            resolve();
         });
     });
 }

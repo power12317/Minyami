@@ -1,22 +1,25 @@
 import * as path from "path";
 import * as fs from "fs";
-import { URL } from "url";
+import * as os from "os";
 import axios, { AxiosRequestConfig } from "axios";
 import { EventEmitter } from "events";
 import logger from "../utils/log";
 import { loadM3U8 } from "../utils/m3u8";
-import * as system from "../utils/system";
-import CommonUtils from "../utils/common";
+import { buildFullUrl, getAvailableOutputPath, getFileExt } from "../utils/common";
+import { deleteDirectory } from "../utils/system";
 import { download, decrypt } from "../utils/media";
 import ProxyAgentHelper from "../utils/agent";
 import UA from "../constants/ua";
-import { EncryptedM3U8Chunk, M3U8Chunk, MasterPlaylist, Playlist } from "./m3u8";
+import FileConcentrator, { TaskStatus } from "./file_concentrator";
+import { isInitialChunk, M3U8Chunk, MasterPlaylist, Playlist } from "./m3u8";
 import type { ActionType } from "./action";
 import * as actions from "./action";
+import { NamingStrategy } from "./types";
 
 export interface DownloaderConfig {
     threads?: number;
     output?: string;
+    tempDir?: string;
     key?: string;
     verbose?: boolean;
     cookies?: string;
@@ -24,7 +27,10 @@ export interface DownloaderConfig {
     retries?: number;
     proxy?: string;
     format?: string;
-    nomerge?: boolean;
+    noMerge?: boolean;
+    keep?: boolean;
+    keepEncryptedChunks?: boolean;
+    chunkNamingStrategy?: NamingStrategy;
     cliMode?: boolean;
 }
 
@@ -34,35 +40,38 @@ export interface ArchiveDownloaderConfig extends DownloaderConfig {
 
 export interface LiveDownloaderConfig extends DownloaderConfig {}
 
-export interface Chunk {
-    url: string;
+export interface DownloadTask {
+    id: number;
     filename: string;
-    isEncrypted: boolean;
-    parentGroup?: ChunkGroup;
-    key?: string;
-    iv?: string;
-    length: number;
-    sequenceId?: number;
-    retryCount?: number;
+    parentGroup?: DownloadTaskGroup;
+    retryCount: number;
+    chunk: M3U8Chunk;
 }
 
-export interface ChunkAction {
+export interface DownloadTaskGroupAction {
     actionName: ActionType;
     actionParams: string;
 }
 
-export interface ChunkGroup {
-    chunks: Chunk[];
-    actions?: ChunkAction[];
+export interface DownloadTaskGroup {
+    subTasks: DownloadTask[];
+    actions?: DownloadTaskGroupAction[];
     isFinished: boolean;
     isNew: boolean;
     retryActions?: boolean;
 }
 
-export type ChunkItem = Chunk | ChunkGroup;
+export type DownloadTaskItem = DownloadTask | DownloadTaskGroup;
 
-export function isChunkGroup(c: ChunkItem): c is ChunkGroup {
-    return !!(c as ChunkGroup).chunks;
+export interface OnKeyUpdatedParams {
+    keyUrls: string[];
+    m3u8Url: string;
+    explicitKeys: string[];
+    saveEncryptionKey: (url: string, key: string) => void;
+}
+
+export function isTaskGroup(c: DownloadTaskItem): c is DownloadTaskGroup {
+    return !!(c as DownloadTaskGroup).subTasks;
 }
 
 class Downloader extends EventEmitter {
@@ -76,17 +85,18 @@ class Downloader extends EventEmitter {
     m3u8: Playlist;
     /** 输出目录 */
     outputPath: string = "./output.ts";
+    /** 输出文件列表 */
+    outputFileList: string[];
     /** 并发数量 */
     threads: number = 5;
 
-    allChunks: ChunkItem[];
-    chunks: ChunkItem[];
-    pickedChunks: ChunkItem[];
+    downloadTasks: DownloadTaskItem[];
+    allDownloadTasks: DownloadTaskItem[];
 
     /** Cookies */
     cookies: string;
     /** HTTP Headers */
-    headers: object = {};
+    headers: Record<string, string> = {};
     key: string;
 
     /** 是否打印调试信息 */
@@ -119,13 +129,36 @@ class Downloader extends EventEmitter {
 
     encryptionKeys = {};
 
-    // Hooks
-    protected onChunkNaming: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string = (chunk) => {
+    keepTemporaryFiles = false;
+
+    keepEncryptedChunks = false;
+
+    chunkNamingStrategy = NamingStrategy.MIXED;
+
+    fileConcentrator: FileConcentrator;
+
+    taskStatusRecord: TaskStatus[] = [];
+
+    _internal_dropChunksInArchiveMode = false;
+
+    protected async onKeyUpdated({ keyUrls, explicitKeys, saveEncryptionKey }: OnKeyUpdatedParams) {}
+
+    protected onTaskOutputFileNaming(chunk: M3U8Chunk, id: number) {
+        if (this.chunkNamingStrategy === NamingStrategy.MIXED) {
+            return `${id.toString().padStart(6, "0")}_${new URL(chunk.url).pathname
+                .split("/")
+                .slice(-1)[0]
+                .slice(17 - 255)}`;
+        }
+        if (this.chunkNamingStrategy === NamingStrategy.USE_FILE_SEQUENCE) {
+            const ext = getFileExt(chunk.url);
+            return `${id.toString().padStart(6, "0")}${ext ? `.${ext}` : ""}`;
+        }
         return new URL(chunk.url).pathname
             .split("/")
             .slice(-1)[0]
-            .slice(8 - 255);
-    };
+            .slice(10 - 255);
+    }
 
     constructor(
         m3u8Path: string,
@@ -139,8 +172,12 @@ class Downloader extends EventEmitter {
             format,
             cookies,
             headers,
-            nomerge,
+            noMerge,
             cliMode = false,
+            keep = false,
+            keepEncryptedChunks,
+            chunkNamingStrategy,
+            tempDir,
         }: DownloaderConfig = {
             threads: 5,
         }
@@ -153,6 +190,18 @@ class Downloader extends EventEmitter {
 
         if (output) {
             this.outputPath = output;
+        }
+
+        if (tempDir) {
+            if (!fs.existsSync(tempDir)) {
+                logger.error("Temporary path directory not exists.");
+                this.emit("critical-error", new Error("Temporary path directory not exists."));
+                return;
+            }
+            logger.info(`Temporary path sets to ${path.resolve(tempDir)}`);
+            this.tempPath = path.resolve(tempDir);
+        } else {
+            this.tempPath = path.resolve(os.tmpdir());
         }
 
         if (key) {
@@ -187,16 +236,20 @@ class Downloader extends EventEmitter {
                     }
                 }
             }
-            // Apply global custom headers
-            axios.defaults.headers.common = {
-                ...axios.defaults.headers.common,
-                ...{
-                    "User-Agent": UA.CHROME_DEFAULT_UA,
-                },
-                ...(this.cookies ? { Cookie: this.cookies } : {}), // Cookies 优先级低于 Custom Headers
-                ...this.headers,
-            };
         }
+
+        // Apply global custom headers
+        axios.defaults.headers.common = {
+            ...axios.defaults.headers.common,
+            ...{
+                "User-Agent": UA.CHROME_DEFAULT_UA,
+            },
+            ...(this.cookies ? { Cookie: this.cookies } : {}), // Cookies 优先级低于 Custom Headers
+            ...this.headers,
+        };
+
+        // Disable proxy settings cause we use custom agent for proxying requests
+        axios.defaults.proxy = false;
 
         if (proxy) {
             this.proxy = proxy;
@@ -205,8 +258,26 @@ class Downloader extends EventEmitter {
             });
         }
 
-        if (nomerge) {
-            this.noMerge = nomerge;
+        if (noMerge) {
+            this.noMerge = noMerge;
+            logger.warning("Chunks will not be merged.");
+            logger.warning("Temporary files will not be deleted automatically.");
+        }
+
+        if (keep) {
+            this.keepTemporaryFiles = keep;
+            logger.warning("Temporary files will not be deleted automatically.");
+        }
+
+        if (keepEncryptedChunks) {
+            this.keepEncryptedChunks = keepEncryptedChunks;
+            logger.info("Encrypted chunks will not be deleted automatically.");
+            if (!this.noMerge) {
+                logger.warning(`--keep-encrypted-chunks should be used with --keep.`);
+            }
+        }
+        if (chunkNamingStrategy) {
+            this.chunkNamingStrategy = +chunkNamingStrategy;
         }
 
         this.m3u8Path = m3u8Path;
@@ -216,6 +287,15 @@ class Downloader extends EventEmitter {
                 `Output file name ends with .mkv is not supported in direct muxing mode, auto changing to .ts.`
             );
             this.outputPath = this.outputPath + ".ts";
+        }
+
+        if (!this.noMerge) {
+            this.outputPath = getAvailableOutputPath(this.outputPath);
+            this.fileConcentrator = new FileConcentrator({
+                outputPath: this.outputPath,
+                taskStatusRecord: this.taskStatusRecord,
+                deleteAfterWritten: !this.keepTemporaryFiles,
+            });
         }
 
         this.cliMode = cliMode;
@@ -240,27 +320,49 @@ class Downloader extends EventEmitter {
      */
     async init() {
         await this.loadM3U8();
+        this.totalChunkLength = this.m3u8.getTotalChunkLength();
     }
 
     async loadM3U8() {
         try {
-            const m3u8 = await loadM3U8(this.m3u8Path, this.retries, this.timeout);
+            const m3u8 = await loadM3U8({
+                path: this.m3u8Path,
+                retries: this.retries,
+                timeout: this.timeout,
+            });
             if (m3u8 instanceof MasterPlaylist) {
                 const streams = m3u8.streams;
                 const bestStream = streams.sort((a, b) => b.bandwidth - a.bandwidth)[0];
                 logger.info("Master playlist input detected. Auto selecting best quality streams.");
                 logger.debug(`Best stream: ${bestStream.url}; Bandwidth: ${bestStream.bandwidth}`);
-                this.m3u8 = (await loadM3U8(bestStream.url, this.retries, this.timeout)) as Playlist;
+                this.m3u8Path = bestStream.url;
+                this.m3u8 = (await loadM3U8({
+                    path: bestStream.url,
+                    retries: this.retries,
+                    timeout: this.timeout,
+                })) as Playlist;
             } else {
                 this.m3u8 = m3u8;
             }
-            this.totalChunkLength = this.m3u8.chunks.reduce(
-                (prevLength, currentChunk) => prevLength + currentChunk.length,
-                0
-            );
         } catch (e) {
             logger.error("Aborted due to critical error.", e);
             this.emit("critical-error", e);
+        }
+    }
+
+    async checkKeys() {
+        if (this.m3u8.encryptKeys.length > 0) {
+            const newKeys = this.m3u8.encryptKeys.filter(
+                (key) => !this.getEncryptionKey(buildFullUrl(this.m3u8.m3u8Url, key))
+            );
+            if (newKeys.length > 0) {
+                await this.onKeyUpdated({
+                    keyUrls: newKeys,
+                    explicitKeys: this.key ? this.key.split(",") : [],
+                    m3u8Url: this.m3u8.m3u8Url,
+                    saveEncryptionKey: this.saveEncryptionKey.bind(this),
+                });
+            }
         }
     }
 
@@ -270,7 +372,7 @@ class Downloader extends EventEmitter {
     async clean() {
         try {
             logger.info("Starting cleaning temporary files.");
-            await system.deleteDirectory(this.tempPath);
+            await deleteDirectory(this.tempPath, this.outputFileList);
         } catch (e) {
             logger.warning(
                 `Fail to delete temporary files, please delete manually or execute "minyami --clean" later.`
@@ -282,26 +384,32 @@ class Downloader extends EventEmitter {
      * 处理块下载任务
      * @param task 块下载任务
      */
-    handleTask(task: Chunk) {
-        logger.debug(`Downloading ${task.url}`);
+    handleTask(task: DownloadTask) {
+        logger.debug(`Downloading ${task.chunk.url}`);
         const options: AxiosRequestConfig = {};
         options.timeout = Math.min(((task.retryCount || 0) + 1) * this.chunkTimeout, this.chunkTimeout * 5);
         return new Promise<void>(async (resolve, reject) => {
             logger.debug(`Downloading ${task.filename}`);
             try {
-                await download(task.url, path.resolve(this.tempPath, `./${task.filename}`), options);
+                await download(task.chunk.url, path.resolve(this.tempPath, `./${task.filename}`), options);
                 logger.debug(`Downloading ${task.filename} succeed.`);
-                if (task.isEncrypted) {
+                if (task.chunk.isEncrypted) {
+                    const decryptIV = isInitialChunk(task.chunk)
+                        ? task.chunk.iv
+                        : task.chunk.iv || task.chunk.sequenceId.toString(16);
                     await decrypt(
                         path.resolve(this.tempPath, `./${task.filename}`),
                         path.resolve(this.tempPath, `./${task.filename}`) + ".decrypt",
-                        this.getEncryptionKey(CommonUtils.buildFullUrl(this.m3u8.m3u8Url, task.key)),
-                        task.iv || task.sequenceId.toString(16)
+                        this.getEncryptionKey(buildFullUrl(this.m3u8.m3u8Url, task.chunk.key)),
+                        decryptIV,
+                        this.keepEncryptedChunks
                     );
                     logger.debug(`Decrypting ${task.filename} succeed`);
                 }
                 this.finishedChunkCount++;
-                this.finishedChunkLength += task.length;
+                if (!isInitialChunk(task.chunk)) {
+                    this.finishedChunkLength += task.chunk.length;
+                }
                 resolve();
             } catch (e) {
                 logger.warning(
@@ -319,7 +427,7 @@ class Downloader extends EventEmitter {
         });
     }
 
-    async handleChunkGroupAction(action: ChunkAction) {
+    async handleChunkGroupAction(action: DownloadTaskGroupAction) {
         try {
             switch (action.actionName) {
                 case "ping": {
@@ -350,8 +458,8 @@ class Downloader extends EventEmitter {
         return this.encryptionKeys[url];
     }
 
-    setOnChunkNaming(handler: (chunk: M3U8Chunk | EncryptedM3U8Chunk) => string) {
-        this.onChunkNaming = handler;
+    setOnKeyUpdated(handler: (params: OnKeyUpdatedParams) => Promise<void>) {
+        this.onKeyUpdated = handler;
     }
 
     /**
@@ -366,6 +474,10 @@ class Downloader extends EventEmitter {
      */
     calculateSpeedByRatio() {
         return (this.finishedChunkLength / Math.round((new Date().valueOf() - this.startedAt) / 1000)).toFixed(2);
+    }
+
+    setOnTaskOutputFileNaming(namingFunction: (chunk: M3U8Chunk, id: number) => string) {
+        this.onTaskOutputFileNaming = namingFunction;
     }
 }
 

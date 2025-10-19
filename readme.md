@@ -8,7 +8,7 @@
 
 -   mkvmerge (optional, mkv output required)
 
-! Minyami requires Node Active/Maintenance LTS latest or Current latest. Active LTS is recommended. Details [here](https://nodejs.org/en/about/releases/).
+! Minyami requires Node Active/Maintenance LTS latest or Current latest. Active LTS is recommended. Details [here](https://nodejs.org/en/about/previous-releases).
 
 Make sure you had put the binary files into your system `PATH`.
 
@@ -37,6 +37,8 @@ Help:
              <limit>               (Optional) Limit of retry times
          --output, o <path>        Output path
              <path>                (Optional) Output file path, defaults to ./output.mkv
+         --temp-dir <path>         Temporary file path
+             <path>                (Optional) Temporary file path, defaults to env.TEMP
          --key <key>               Set key manually (Internal use)
              <key>                 (Optional) Key for decrypt video.
          --cookies <cookies>       Cookies used to download
@@ -48,9 +50,13 @@ Help:
              <format_name>         Format name. ts or mkv.
          --proxy <proxy-server>    Use the specified HTTP/HTTPS/SOCKS5 proxy
              <proxy-server>        Set proxy in [protocol://<host>:<port>] format. eg. --proxy "http://127.0.0.1:1080".
+         --no-proxy                Disable reading proxy configuration from system environment variables or system settings.
          --slice <range>           Download specified part of the stream
              <range>               Set time range in [<hh:mm:ss>-<hh:mm:ss> format]. eg. --slice "45:00-53:00"
-         --nomerge, keep           Do not merge m3u8 chunks.
+         --no-merge                Do not merge m3u8 chunks.
+         --keep, k                 Keep temporary files.
+         --keep-encrypted-chunks   Do not delete encrypted chunks after decryption.
+         --chunk-naming-strategy   Temporary file naming strategy. Defaults to 1.
      --resume <input_path>         Resume a download. (Archive)  -r
          <input_path>              m3u8 file path
      --clean                       Clean cache files
@@ -59,7 +65,6 @@ Options:
 
      Options                       Description
      --verbose, debug              Debug output
-
 ```
 
 ## FAQ
@@ -70,11 +75,12 @@ A: It's not necessary.
 
 Q: How to set proxy for Minyami?
 
-A: You can use `--proxy` to set proxy server for Minyami. HTTP/SOCKS5 proxy are supported. Or you can use environment variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to provide proxy configuration for Minyami.
+A: You can use `--proxy` to set proxy server for Minyami. HTTP/SOCKS5 proxy are supported. Or you can use environment variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` to provide proxy configuration for Minyami. And Minyami will read proxy settings from environment variables and Windows system proxy settings. To disable any proxy setting from context, you can add `--disable-proxy` or set `env.NO_PROXY` to and non-empty values.
+
 
 Q: How to set temporary file location?
 
-A: You can use environment variables to set the directory of temporary files. See [Issue #80](https://github.com/Last-Order/Minyami/issues/80#issuecomment-869132412).
+A: You can use `--temp-dir` to set the directory of temporary files.
 
 Q: How to set multiple HTTP headers?
 
@@ -136,4 +142,4 @@ To build the project, just run `tsc`.
 
 ## Copyright
 
-Open-sourced under GPLv3. © 2018-2022, Eridanus Sora, member of MeowSound Idols.
+Open-sourced under GPLv3. © 2018-2025, Eridanus Sora, member of MeowSound Idols.

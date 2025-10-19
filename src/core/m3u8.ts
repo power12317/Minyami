@@ -1,22 +1,43 @@
-import CommonUtils from "../utils/common";
+import { buildFullUrl } from "../utils/common";
+import logger from "../utils/log";
 
 export class M3U8ParseError extends Error {}
 
-export interface M3U8Chunk {
+interface BaseChunk {
     url: string;
-    sequenceId: number;
+}
+
+interface NormalChunk extends BaseChunk {
     length: number;
+    sequenceId: number;
+    isInitialChunk: false;
+}
+
+interface InitialChunk extends BaseChunk {
+    isInitialChunk: true;
+}
+
+interface PlainNormalChunk extends NormalChunk {
     isEncrypted: false;
 }
 
-export interface EncryptedM3U8Chunk {
-    url: string;
-    sequenceId: number;
-    length: number;
+interface EncryptedNormalChunk extends NormalChunk {
     key: string;
     iv: string;
     isEncrypted: true;
 }
+
+interface PlainInitialChunk extends InitialChunk {
+    isEncrypted: false;
+}
+
+interface EncryptedInitialChunk extends InitialChunk {
+    key: string;
+    iv: string;
+    isEncrypted: true;
+}
+
+export type M3U8Chunk = PlainNormalChunk | EncryptedNormalChunk | PlainInitialChunk | EncryptedInitialChunk;
 
 export interface Stream {
     url: string;
@@ -25,6 +46,18 @@ export interface Stream {
     frameRate?: number;
     resolution?: { width: number; height: number };
 }
+
+export const isInitialChunk = (chunk: M3U8Chunk): chunk is PlainInitialChunk | EncryptedInitialChunk => {
+    return chunk.isInitialChunk;
+};
+
+export const isNormalChunk = (chunk: M3U8Chunk): chunk is PlainNormalChunk | EncryptedNormalChunk => {
+    return !isInitialChunk(chunk);
+};
+
+export const isEncryptedChunk = (chunk: M3U8Chunk): chunk is EncryptedNormalChunk | EncryptedInitialChunk => {
+    return chunk.isEncrypted;
+};
 
 const getTagBody = (line: string) => line.split(":").slice(1).join(":");
 
@@ -80,7 +113,7 @@ export class MasterPlaylist {
                 if (!nextLine.startsWith("http") && !this.m3u8Url) {
                     throw new M3U8ParseError("Missing full url for M3U8.");
                 }
-                const url = CommonUtils.buildFullUrl(this.m3u8Url, nextLine);
+                const url = buildFullUrl(this.m3u8Url, nextLine);
                 const streamInfo: Stream = {
                     url,
                     bandwidth: +parsedTagBody["BANDWIDTH"],
@@ -101,15 +134,22 @@ export class MasterPlaylist {
     }
 }
 
+export interface PlaylistParseParams {
+    m3u8Content: string;
+    m3u8Url?: string;
+}
+
 export class Playlist {
     m3u8Content: string;
     m3u8Url: string;
+    sequenceId: number = 0;
     isEnd: boolean = false;
-    chunks: (M3U8Chunk | EncryptedM3U8Chunk)[] = [];
+    chunks: M3U8Chunk[] = [];
     encryptKeys: string[] = [];
     averageChunkLength = 0;
+    totalChunkLength = 0;
 
-    constructor({ m3u8Content, m3u8Url = "" }: { m3u8Content: string; m3u8Url?: string }) {
+    constructor({ m3u8Content, m3u8Url = "" }: PlaylistParseParams) {
         this.m3u8Content = m3u8Content;
         this.m3u8Url = m3u8Url;
         this.parse();
@@ -121,8 +161,8 @@ export class Playlist {
     private parse() {
         let key: string,
             iv: string,
-            sequenceId = 0,
-            isEncrypted = false;
+            isEncrypted = false,
+            warned = false;
         const lines = this.m3u8Content.split("\n");
         for (let i = 0; i <= lines.length - 1; i++) {
             /**
@@ -137,7 +177,7 @@ export class Playlist {
                  * @see https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.3.2
                  */
                 const tagBody = getTagBody(currentLine);
-                sequenceId = parseInt(tagBody);
+                this.sequenceId = parseInt(tagBody);
             }
             if (currentLine.startsWith("#EXT-X-KEY")) {
                 /**
@@ -145,18 +185,23 @@ export class Playlist {
                  */
                 const tagBody = getTagBody(currentLine);
                 const parsedTagBody = parseTagBody(tagBody);
-                if (parsedTagBody["METHOD"] === "NONE") {
-                    isEncrypted = false;
-                } else if (parsedTagBody["METHOD"] === "AES-128") {
+                if (parsedTagBody["METHOD"] === "AES-128") {
                     isEncrypted = true;
                     key = parsedTagBody["URI"];
                     if (parsedTagBody["IV"]) {
                         iv = parsedTagBody["IV"].match(/0x([^,]+)/)[1];
                     }
                     this.encryptKeys.push(key);
+                } else if (parsedTagBody["METHOD"] === "NONE") {
+                    isEncrypted = false;
                 } else {
-                    // SAMPLE-AES is rare in production and it's not supported by Minyami.
-                    throw new M3U8ParseError("Unsupported encrypt method.");
+                    isEncrypted = false;
+                    if (!warned) {
+                        logger.warning(
+                            `Unsupported encryption method: "${parsedTagBody["METHOD"]}". Chunks will not be decrypted.`
+                        );
+                        warned = true;
+                    }
                 }
             }
             if (currentLine.startsWith("#EXT-X-MAP")) {
@@ -173,13 +218,21 @@ export class Playlist {
                 if (!initialSegmentUrl.startsWith("http") && !this.m3u8Url) {
                     throw new M3U8ParseError("Missing full url for M3U8.");
                 }
+                if (isEncrypted && !iv) {
+                    /**
+                     * If the Media Initialization Section declared by an EXT-X-MAP tag is
+                     * encrypted with a METHOD of AES-128, the IV attribute of the EXT-X-KEY
+                     * tag that applies to the EXT-X-MAP is REQUIRED.
+                     * @see https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.2.5
+                     */
+                    throw new M3U8ParseError("Missing IV for encrypted initialization segment");
+                }
                 this.chunks.push({
-                    url: CommonUtils.buildFullUrl(this.m3u8Url, initialSegmentUrl),
+                    url: buildFullUrl(this.m3u8Url, initialSegmentUrl),
                     isEncrypted,
-                    length: 0,
-                    sequenceId: 0,
                     key,
                     iv,
+                    isInitialChunk: true,
                 });
             }
             if (currentLine.startsWith("#EXT-X-ENDLIST")) {
@@ -189,7 +242,15 @@ export class Playlist {
             if (currentLine.startsWith("#EXTINF")) {
                 const tagBody = getTagBody(currentLine);
                 const chunkLength = parseFloat(tagBody.split(",")[0]) || 5.0;
-                const nextLine = lines[i + 1];
+                let nextLine: string,
+                    j: number = i;
+                while (j <= lines.length - 1) {
+                    j += 1;
+                    if (!lines[j].startsWith("#")) {
+                        nextLine = lines[j];
+                        break;
+                    }
+                }
                 if (!nextLine) {
                     throw new M3U8ParseError("Invalid M3U8 file.");
                 }
@@ -198,26 +259,28 @@ export class Playlist {
                 }
                 if (isEncrypted) {
                     this.chunks.push({
-                        url: CommonUtils.buildFullUrl(this.m3u8Url, nextLine),
+                        url: buildFullUrl(this.m3u8Url, nextLine),
                         length: chunkLength,
                         isEncrypted: true,
                         key,
                         iv,
-                        sequenceId,
+                        sequenceId: this.sequenceId,
+                        isInitialChunk: false,
                     });
                 } else {
                     this.chunks.push({
-                        url: CommonUtils.buildFullUrl(this.m3u8Url, nextLine),
+                        url: buildFullUrl(this.m3u8Url, nextLine),
                         length: chunkLength,
                         isEncrypted: false,
-                        sequenceId,
+                        sequenceId: this.sequenceId,
+                        isInitialChunk: false,
                     });
                 }
                 /**
                  * @see https://datatracker.ietf.org/doc/html/rfc8216#section-3
                  * The Media Sequence Number of the first segment in the Media Playlist is either 0 or declared in the * Playlist (Section 4.3.3.2). The Media Sequence Number of every other segment is equal to the Media * Sequence Number of the segment that precedes it plus one.
                  */
-                sequenceId++;
+                this.sequenceId++;
             }
         }
     }
@@ -230,8 +293,19 @@ export class Playlist {
         if (this.averageChunkLength) {
             return this.averageChunkLength;
         }
-        const result = this.chunks.reduce((prevLength, chunk) => prevLength + chunk.length, 0) / this.chunks.length;
+        const totalLength = this.chunks.filter(isNormalChunk).reduce((acc, cur) => acc + cur.length, 0);
+        const totalCount = this.chunks.filter(isNormalChunk).length;
+        const result = totalLength / totalCount;
         this.averageChunkLength = result;
+        return result;
+    }
+
+    public getTotalChunkLength(): number {
+        if (this.totalChunkLength) {
+            return this.totalChunkLength;
+        }
+        const result = this.chunks.filter(isNormalChunk).reduce((acc, cur) => acc + cur.length, 0);
+        this.totalChunkLength = result;
         return result;
     }
 }
@@ -239,15 +313,28 @@ export class Playlist {
 export default class M3U8 {
     m3u8Content: string;
     m3u8Url: string;
-    constructor({ m3u8Content, m3u8Url }: { m3u8Content: string; m3u8Url?: string }) {
+    initPrimaryKey: number;
+    constructor({
+        m3u8Content,
+        m3u8Url,
+        initPrimaryKey,
+    }: {
+        m3u8Content: string;
+        m3u8Url?: string;
+        initPrimaryKey?: number;
+    }) {
         this.m3u8Content = m3u8Content;
         this.m3u8Url = m3u8Url;
+        this.initPrimaryKey = initPrimaryKey;
     }
     parse() {
         if (this.m3u8Content.includes("#EXT-X-STREAM-INF")) {
             return new MasterPlaylist({ m3u8Content: this.m3u8Content, m3u8Url: this.m3u8Url });
         } else {
-            return new Playlist({ m3u8Content: this.m3u8Content, m3u8Url: this.m3u8Url });
+            return new Playlist({
+                m3u8Content: this.m3u8Content,
+                m3u8Url: this.m3u8Url,
+            });
         }
     }
 }
