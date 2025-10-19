@@ -2,11 +2,29 @@ import { Agent } from "agent-base";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import logger from "./log";
+import { default as Registry } from "winreg";
+
+interface RegistryKeyItem {
+    name: string;
+    value: string;
+}
+
+const readRegistryKey = (key: any): Promise<RegistryKeyItem[]> => {
+    return new Promise((resolve, reject) => {
+        key.values((err, items) => {
+            if (err) {
+                reject(err);
+            }
+            resolve(items);
+        });
+    });
+};
 
 class InvalidProxyServerError extends Error {}
 
 class ProxyAgentHelper {
     proxyAgentInstance: Agent = null;
+    isEnableProxy = true;
 
     constructor() {}
 
@@ -22,7 +40,9 @@ class ProxyAgentHelper {
         }
         if (proxy.startsWith("http://") || proxy.startsWith("https://")) {
             // HTTP Proxy
-            this.proxyAgentInstance = new HttpsProxyAgent(proxy);
+            this.proxyAgentInstance = new HttpsProxyAgent(proxy, {
+                keepAlive: true,
+            });
             logger.debug(`HTTP/HTTPS Proxy set: ${proxy}`);
         } else if (proxy.startsWith("socks")) {
             if (proxy.startsWith("socks4")) {
@@ -31,7 +51,9 @@ class ProxyAgentHelper {
             // Socks5 Proxy
             try {
                 const [_, host, port] = proxy.match(/socks5?(?:(?<=5)h)?[:：]\/\/(.+)[:：](\d+)/);
-                this.proxyAgentInstance = new SocksProxyAgent(`socks5h://${host}:${port}`);
+                this.proxyAgentInstance = new SocksProxyAgent(`socks5h://${host}:${port}`, {
+                    keepAlive: true,
+                });
                 logger.debug(`Socks5 Proxy set: socks5h://${host}:${port}`);
             } catch (e) {
                 throw new InvalidProxyServerError("Proxy server invalid.");
@@ -40,8 +62,21 @@ class ProxyAgentHelper {
             // For compatibility, use proxy without protocol as socks5 proxy
             try {
                 const [_, host, port] = proxy.match(/(.+)[:：](\d+)/);
-                this.proxyAgentInstance = new SocksProxyAgent(`socks5h://${host}:${port}`);
+                this.proxyAgentInstance = new SocksProxyAgent(`socks5h://${host}:${port}`, {
+                    keepAlive: true,
+                });
                 logger.debug(`Socks5 Proxy set: socks5h://${host}:${port}`);
+            } catch (e) {
+                throw new InvalidProxyServerError("Proxy server invalid.");
+            }
+        } else if (proxy.includes(":")) {
+            // Treat as an http proxy without protocol prefix
+            try {
+                const [_, host, port] = proxy.match(/(.+)[:：](\d+)/);
+                this.proxyAgentInstance = new HttpsProxyAgent(`http://${host}:${port}`, {
+                    keepAlive: true,
+                });
+                logger.debug(`HTTP Proxy set: http://${host}:${port}`);
             } catch (e) {
                 throw new InvalidProxyServerError("Proxy server invalid.");
             }
@@ -50,16 +85,74 @@ class ProxyAgentHelper {
         }
     }
 
+    /**
+     * Whether the proxy is enabled
+     */
+    isProxyEnabled() {
+        return this.isEnableProxy;
+    }
+
+    /**
+     * Disable the proxy
+     */
+    disableProxy() {
+        this.isEnableProxy = false;
+    }
+
+    /**
+     * Enable the proxy
+     */
+    enableProxy() {
+        this.isEnableProxy = true;
+    }
+
     getProxyAgentInstance() {
+        if (!this.isEnableProxy) {
+            return null;
+        }
         return this.proxyAgentInstance;
     }
 
     /**
      * Read proxy configuration from environment variables.
      * By default, ALL_PROXY, HTTP_PROXY and HTTPS_PROXY will be used.
+     * Note: environment variables will override system proxy in Windows.
      */
     readProxyConfigurationFromEnv() {
-        this.setProxy(process.env.ALL_PROXY || process.env.HTTP_PROXY || process.env.HTTPS_PROXY);
+        const proxySettings = process.env.ALL_PROXY || process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+        if (proxySettings) {
+            this.setProxy(proxySettings);
+        }
+    }
+
+    /**
+     * Read Windows system proxy from registry
+     */
+    async readWindowsSystemProxy() {
+        if (process.platform !== "win32") {
+            // not a windows environment
+            return;
+        }
+        const key = new Registry({
+            hive: Registry.HKCU,
+            key: "\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        });
+        try {
+            const items = await readRegistryKey(key);
+            const proxyEnableItem = items.find((item) => item.name === "ProxyEnable");
+            const proxyServerItem = items.find((item) => item.name === "ProxyServer");
+            const isProxyEnable = proxyEnableItem.value === "0x1";
+            if (isProxyEnable && proxyServerItem && proxyServerItem.value !== "") {
+                if (proxyServerItem.value.startsWith("socks=")) {
+                    // socks proxy
+                    this.setProxy(proxyServerItem.value.replace("socks=", "socks5://"));
+                } else {
+                    this.setProxy(`http://${proxyServerItem.value}`);
+                }
+            }
+        } catch {
+            // ignore
+        }
     }
 }
 
